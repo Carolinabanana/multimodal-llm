@@ -415,33 +415,41 @@ class Transformer(Module):
         model_name: Optional[str] = None,
     ):
         super().__init__()
+        
+
+        self.model_name = model_name
+        if model_name is not None:
+            self.pretrained_model = AutoModelForCausalLM.from_pretrained(model_name)
+            dim = self.pretrained_model.config.hidden_size
+
+        else:
+
+            self.dim = dim
+            self.dim_head = dim_head
+
+            layers = ModuleList([])
+
+            for _ in range(depth):
+                attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = dropout, **attn_kwargs)
+
+                ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor, **ff_kwargs)
+
+                attn = AdaptiveWrapper(attn, dim = dim, dim_cond = dim * 4)
+                ff = AdaptiveWrapper(ff, dim = dim, dim_cond = dim * 4)
+
+                layers.append(ModuleList([attn, ff]))
+
+                self.layers = layers
+                self.norm = RMSNorm(dim)
+
         self.dim = dim
         self.dim_head = dim_head
-
+        
         self.to_time_cond = nn.Sequential(
             RandomFourierEmbed(dim),
             nn.Linear(dim + 1, dim * 4),
             nn.SiLU()
         )
-
-        layers = ModuleList([])
-
-        for _ in range(depth):
-            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = dropout, **attn_kwargs)
-
-            ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor, **ff_kwargs)
-
-            attn = AdaptiveWrapper(attn, dim = dim, dim_cond = dim * 4)
-            ff = AdaptiveWrapper(ff, dim = dim, dim_cond = dim * 4)
-
-            layers.append(ModuleList([attn, ff]))
-
-        self.layers = layers
-        self.norm = RMSNorm(dim)
-        self.model_name = model_name
-        if model_name is not None:
-            self.pretrained_model = AutoModelForCausalLM.from_pretrained(model_name)
-            
 
     def forward(
         self,
@@ -472,7 +480,9 @@ class Transformer(Module):
             is_any_modality = modality_positions_to_is_modality_mask(seq_len, modality_positions).any(dim = 1)
 
         if self.model_name is not None:
-            x = self.pretrained_model(inputs_embeds=x, attention_mask=attn_mask).last_hidden_state
+            x = self.pretrained_model(inputs_embeds=x, attention_mask=attn_mask.unsqueeze(1), output_hidden_states=True).hidden_states[-1]
+
+            return x
         else:
             adaptive_kwargs = dict(cond = cond, is_any_modality = is_any_modality)
 
@@ -513,9 +523,9 @@ class Transfusion(Module):
 
         # embeddings and un-embeddings
 
-        self.text_embed = nn.Embedding(num_text_tokens, dim)
+        self.text_embed = nn.Embedding(num_text_tokens, dim) if self.transformer.model_name is None else self.transformer.pretrained_model.model.embed_tokens
 
-        self.to_text_logits = nn.Linear(dim, num_text_tokens, bias = False)
+        self.to_text_logits = nn.Linear(dim, num_text_tokens, bias = False)  if self.transformer.model_name is None else self.transformer.pretrained_model.lm_head
 
         self.flattened_dim = flattened_dim
 

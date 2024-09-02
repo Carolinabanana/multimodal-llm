@@ -6,26 +6,31 @@ from transformers import AutoTokenizer
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from diffusers import AutoencoderKL
+from vae import vae_decode
 from wrapper import ModelWrapper
 import argparse
 from tqdm import tqdm
 from inference import debug_image, inference
+from schedulefree import AdamWScheduleFree
 
 def train():
     # Add command-line argument parsing
     parser = argparse.ArgumentParser(description='Train the Transfusion model')
     parser.add_argument('--resume', action='store_true', help='Resume training from checkpoint')
     args = parser.parse_args()
+    model_name = 'Qwen/Qwen2-0.5B'
 
     text_image_pairs = load_pairs_from_disk('pairs.pkl')
-    tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2-1.5B-Instruct')
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae")
     max_length = 64
     image_size = 256
     batch_size = 8
     patch_size = 2
-    N_debug = 10
-    N_inference = 10
+    diffusion_loss_weight = 20
+    warmup_steps = 0
+    N_debug = 20
+    N_inference = 200
     N_save = 1000
     N_loss_window = 100  # Number of steps for moving average
     device = 'cuda' if torch.cuda.is_available() else 'mps'
@@ -39,9 +44,9 @@ def train():
     'ff_expansion_factor': 4, 
     'attn_kwargs': {},  
     'ff_kwargs': {},
-    'model_name': None
+    'model_name':None#model_name
 }
-    transfusion = Transfusion(num_text_tokens=tokenizer.vocab_size+3, transformer=config, diffusion_loss_weight=5, flattened_dim=vae.config.latent_channels*patch_size*patch_size)
+    transfusion = Transfusion(num_text_tokens=tokenizer.vocab_size+3, transformer=config, diffusion_loss_weight=diffusion_loss_weight, flattened_dim=vae.config.latent_channels*patch_size*patch_size)
     # Print model parameter count
     
     model = ModelWrapper(transfusion, image_size=image_size, embed_dim=transfusion.transformer.dim, patch_size=patch_size, max_length=max_length, vae=vae).to(device)
@@ -53,7 +58,9 @@ def train():
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
-    optimizer = AdamW(model.parameters(), lr=1e-5)
+    #optimizer = AdamW(model.parameters(), lr=1e-5)
+    optimizer = AdamWScheduleFree(model.parameters(), lr=1e-4, foreach=torch.cuda.is_available(), warmup_steps=warmup_steps)
+    optimizer.train()
 
     # Initialize epoch and step counter
     start_epoch = 0
@@ -77,6 +84,13 @@ def train():
     # Sample for inference
     sample_text = next(iter(dataloader))['input_ids'][0].unsqueeze(0).to(device)
     sample_latents = next(iter(dataloader))['image_latents'][0].unsqueeze(0).to(device)
+
+    # Decode the sample latents using the VAE
+    decoded_sample_latents = vae_decode(sample_latents, model.vae)
+
+    # Create a folder to save the decoded sample latents if it doesn't exist
+    os.makedirs('inference_results', exist_ok=True)
+    decoded_sample_latents.save(f'inference_results/sample_latents_epoch_0.png')
     
     # Add noise to the sample latents
     noise = torch.randn_like(sample_latents)
@@ -136,7 +150,7 @@ def train():
 
             
             if step_counter % N_inference == 0:
-                inference(model, sample_text, sample_latents, epoch, step_counter)
+                inference(model, optimizer, sample_text, sample_latents, epoch, step_counter)
 
             # Save the model every N steps
             if step_counter % N_save == 0:

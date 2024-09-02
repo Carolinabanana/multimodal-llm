@@ -7,8 +7,11 @@ import torch.nn.functional as F
 from vae import vae_decode
 from PIL import Image
 
-def inference(model, text, latents, epoch, step_counter, steps=50):
+def inference(model, optimizer, text, latents, epoch, step_counter, steps=50):
         with torch.no_grad():
+            model.eval()
+            if hasattr(optimizer, 'eval'):
+                optimizer.eval()
             timestep = 0.8 
             times = torch.full((latents.shape[0],1), timestep, device=latents.device)
 
@@ -24,6 +27,9 @@ def inference(model, text, latents, epoch, step_counter, steps=50):
             # Save the decoded image
             decoded_images.save(f'inference_results/inference_epoch_{epoch+1}_step_{step_counter}.png')
             print("Inference complete.")
+            model.train()
+            if hasattr(optimizer, 'train'):
+                optimizer.train()
 
 def debug_image(model, image_patches, noise, predicted_noise, target_noise, noisy_latent, denoised_image, epoch, step_counter):
 
