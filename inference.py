@@ -7,17 +7,14 @@ import torch.nn.functional as F
 from vae import vae_decode
 from PIL import Image
 
-def inference(model, optimizer, text, latents, epoch, step_counter, steps=50):
+def inference(model, optimizer, text, latents, save_path, steps=50, start_timestep=0.0):
         with torch.no_grad():
             model.eval()
             if hasattr(optimizer, 'eval'):
                 optimizer.eval()
-            timestep = 0.8 
-            times = torch.full((latents.shape[0],1), timestep, device=latents.device)
 
             #todo add noise before inference loop
-
-            _, _, denoised_tokens, noise, flow, pred_flow, noised_image = model(text=text, latents=latents, times=times, return_loss=False)
+            _, _, denoised_tokens, _, _, _, _ = model(text=text, latents=latents, num_inference_steps=steps, return_loss=False, start_timestep=0.0)
    
             decoded_images = vae_decode(denoised_tokens, model.vae)
 
@@ -25,7 +22,7 @@ def inference(model, optimizer, text, latents, epoch, step_counter, steps=50):
             os.makedirs('inference_results', exist_ok=True)
 
             # Save the decoded image
-            decoded_images.save(f'inference_results/inference_epoch_{epoch+1}_step_{step_counter}.png')
+            decoded_images.save(save_path)
             print("Inference complete.")
             model.train()
             if hasattr(optimizer, 'train'):
@@ -90,4 +87,6 @@ def debug_image(model, image_patches, noise, predicted_noise, target_noise, nois
 
     # Save the combined image
     combined_image.save(f'debug_results/debug_epoch_{epoch+1}_step_{step_counter}.png')
+
+
 

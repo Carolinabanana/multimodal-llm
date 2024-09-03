@@ -15,31 +15,16 @@ class TransfusionDataset(Dataset):
         self.device = device
         self.max_length = max_length
         self.image_size = image_size
-        
-        # Add special tokens
-        special_tokens = {"additional_special_tokens": ["<BOI>", "<EOI>","<MODALITY>"]}
-        self.tokenizer.add_special_tokens(special_tokens)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def __len__(self):
         return len(self.text_image_pairs)
 
     def __getitem__(self, idx):
         text, image_path = self.text_image_pairs[idx]
+
+        tokenized_text = encode_text(text, self.tokenizer, self.model, self.max_length)
         # Calculate the length of the image sequence
-        image_seq_len = self.model.latent_dim * self.model.latent_dim
-
-        # Tokenize text with special tokens
-        tokenized_text = self.tokenizer(text, max_length=self.max_length, padding="max_length", truncation=True, return_tensors="pt")
-
-        # Create the image token sequence
-        image_tokens = f"<BOI>"+"<MODALITY>"*image_seq_len+"<EOI>"
         
-        # Append image tokens to the tokenized text
-        image_token_ids = self.tokenizer.encode(image_tokens, add_special_tokens=False)
-        tokenized_text['input_ids'] = torch.cat([tokenized_text['input_ids'], torch.tensor([image_token_ids])], dim=1)
-        tokenized_text['attention_mask'] = torch.cat([tokenized_text['attention_mask'], torch.ones(1, len(image_token_ids))], dim=1)
-
         image = Image.open(image_path).convert("RGB")
         
         # Load and process image
@@ -50,6 +35,23 @@ class TransfusionDataset(Dataset):
             "attention_mask": tokenized_text.attention_mask.squeeze(),
             "image_latents": image_latents
         }
+    
+def encode_text(text, tokenizer, model, max_length):
+    image_seq_len = model.latent_dim * model.latent_dim
+
+    # Tokenize text with special tokens
+    tokenized_text = tokenizer(text, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
+
+    # Create the image token sequence
+    image_tokens = f"<|im_start|>"+"<|endoftext|>"*image_seq_len+"<|im_end|>"
+    
+    # Append image tokens to the tokenized text
+    image_token_ids = tokenizer.encode(image_tokens, add_special_tokens=False)
+    tokenized_text['input_ids'] = torch.cat([tokenized_text['input_ids'], torch.tensor([image_token_ids])], dim=1)
+    tokenized_text['attention_mask'] = torch.cat([tokenized_text['attention_mask'], torch.ones(1, len(image_token_ids))], dim=1)
+
+    return tokenized_text
+
     
 def create_text_image_pairs(folder_path):
     text_image_pairs = []
@@ -92,9 +94,27 @@ def save_checkpoint(model, optimizer, loss, epoch, step_counter):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
+        #'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
         'step_counter': step_counter,
     }, f'checkpoints/model_checkpoint_epoch_{epoch+1}_step_{step_counter}.pth')
     print("Model saved successfully.")
-    
+
+def resume_checkpoint(model, optimizer, scheduler, device):
+    checkpoint_files = [f for f in os.listdir('./checkpoints') if f.startswith('model_checkpoint_epoch_') and f.endswith('.pth')]
+    if checkpoint_files:
+        latest_checkpoint = max(checkpoint_files)
+        load_checkpoint(f'./checkpoints/{latest_checkpoint}', model, optimizer, scheduler, device)
+
+def load_checkpoint(model_path, model, optimizer, scheduler, device):
+    print(f"Loading checkpoint: {model_path}")
+    checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    #optimizer.load_state_dict(checkpoint['optimizer_state_dict']) if optimizer is not None else None
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict']) if scheduler is not None else None
+    start_epoch = checkpoint['epoch'] + 1
+    step_counter = checkpoint['step_counter']
+    print(f"Resuming from epoch {start_epoch} step {step_counter}")
+
+    return model, optimizer, scheduler, start_epoch, step_counter

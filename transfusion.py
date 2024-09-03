@@ -48,7 +48,7 @@ import einx
 from einops import rearrange, repeat, reduce, einsum, pack
 from einops.layers.torch import Rearrange
 
-from transfusion_pytorch.tensor_typing import Float, Int, Bool
+from tensor_typing import Float, Int, Bool
 
 from transformers import AutoModelForCausalLM
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
@@ -152,7 +152,7 @@ def derive_rotary_positions_from_modality_positions(
     modality_mask = modality_positions_to_is_modality_mask(seq_len, modalities, offset = torch.tensor([1, -1]))
     is_any_modality = modality_mask.any(dim = 1)
 
-    return torch.arange(seq_len, device = device) - is_any_modality.cumsum(dim = -1)
+    return torch.arange(seq_len, device = device).unsqueeze(0).expand(modalities.shape[0], -1) #- is_any_modality.cumsum(dim = -1)
 
 # modality tokens are given as list of tensors, can be then be embedded into the modality tokens for attending alongside text tokens
 
@@ -420,7 +420,10 @@ class Transformer(Module):
         self.model_name = model_name
         if model_name is not None:
             self.pretrained_model = AutoModelForCausalLM.from_pretrained(model_name)
+            self.pretrained_model.gradient_checkpointing_enable()
+            self.pretrained_model.train()
             dim = self.pretrained_model.config.hidden_size
+
 
         else:
 
@@ -480,7 +483,7 @@ class Transformer(Module):
             is_any_modality = modality_positions_to_is_modality_mask(seq_len, modality_positions).any(dim = 1)
 
         if self.model_name is not None:
-            x = self.pretrained_model(inputs_embeds=x, attention_mask=attn_mask.unsqueeze(1), output_hidden_states=True).hidden_states[-1]
+            x = self.pretrained_model(inputs_embeds=x, attention_mask=attn_mask.float().unsqueeze(1), output_hidden_states=True).hidden_states[-1]
 
             return x
         else:
@@ -504,7 +507,8 @@ class Transfusion(Module):
         transformer: dict | Transformer,
         ignore_index = -1,
         diffusion_loss_weight = 1.,
-        flattened_dim = 16
+        flattened_dim = 16,
+        gradient_checkpointing = False
     ):
         super().__init__()
 
@@ -533,6 +537,8 @@ class Transfusion(Module):
 
         self.to_pred_flow = nn.Linear(dim, self.flattened_dim, bias = False)
 
+        self.gradient_checkpointing = gradient_checkpointing
+
         # loss related
 
         self.ignore_index = ignore_index
@@ -544,7 +550,9 @@ class Transfusion(Module):
         modality_tokens: list[list[Float['_ d']]] | Float['b n d'],
         modality_positions: RawModalityPositions | Int['b m 2'],
         times: Float['b m'] | None = None,
-        return_loss = True
+        return_loss = True,
+        num_inference_steps: int = 50,
+        start_timestep: float = 0.0
     ) -> (
         Float['b n l'] |
         tuple[Float[''], LossBreakdown]
@@ -588,37 +596,38 @@ class Transfusion(Module):
         rotary_emb = self.rotary_emb(rotary_positions)
         rotary_emb = rearrange(rotary_emb, 'b n d -> b 1 n d')
 
-        times = einsum(is_modalities.float(), times, 'b m n, b m -> b n')
-        padded_times = rearrange(times, 'b n -> b n 1')
-        noise = torch.randn_like(modality_tokens)
-
-        modality_tokens = modality_tokens * padded_times + noise * (1. - padded_times)
-        noised_image = modality_tokens.clone().detach()
-        flow = modality_tokens - noise
-
         text_tokens = self.text_embed(text)
 
         if return_loss:
+            
+            times = einsum(is_modalities.float(), times, 'b m n, b m -> b n')
+            padded_times = rearrange(times, 'b n -> b n 1')
+            noise = torch.randn_like(modality_tokens)
+
+            modality_tokens = modality_tokens * padded_times + noise * (1. - padded_times)
+            noised_image = modality_tokens.clone().detach()
+            flow = modality_tokens - noise
 
             modality_tokens_hidden = self.to_hidden(modality_tokens)
 
             tokens = einx.where('b n, b n d, b n d', is_any_modality, modality_tokens_hidden, text_tokens)
 
             embed = self.transformer(
-            tokens,
-            times = times,
-            rotary_emb = rotary_emb,
-            modality_positions = modality_positions
-            )
+                    tokens,
+                    times = times,
+                    rotary_emb = rotary_emb,
+                    modality_positions = modality_positions
+                )  
 
             pred_flow = self.to_pred_flow(embed)
             with torch.no_grad():
                 output_tokens = modality_tokens + pred_flow
         else:
             with torch.no_grad():
-                n_steps = 50
-                steps = torch.linspace(0,1, n_steps)
-                dn = 1.0 / n_steps
+                steps = torch.linspace(start_timestep,1, num_inference_steps)
+                dn = (1.0 - start_timestep) / num_inference_steps
+                flow = torch.zeros_like(modality_tokens)
+                noised_image = modality_tokens.clone().detach()
 
                 for step in tqdm(steps, desc="Inference", leave=False):
                     

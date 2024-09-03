@@ -27,7 +27,7 @@ def vae_encode(image:Image, size, vae):
         image_np = (image_np - 0.5) * 2.0
         
         # Convert the image to a PyTorch tensor
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).to("mps")
+        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).to(vae.device)
         
         # Encode the image using the VAE
         

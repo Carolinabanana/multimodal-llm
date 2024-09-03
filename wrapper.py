@@ -2,7 +2,7 @@ from einops import rearrange
 import torch
 import torch.nn.functional as F
 
-from transfusionpytorch.transfusion_pytorch.transfusion import LossBreakdown
+from transfusion import LossBreakdown
 
 class ModelWrapper(torch.nn.Module):
     def __init__(self, model, vae, image_size=256, max_length=256, embed_dim=512, patch_size=2):
@@ -14,10 +14,9 @@ class ModelWrapper(torch.nn.Module):
         self.max_length = max_length
         self.vae = vae
 
-    def forward(self, text, latents, times=None, return_loss=True):
+    def forward(self, text, latents, times=None, return_loss=True, num_inference_steps=50, start_timestep=0.0):
         # Patchify and flatten the latents
         B, C, H, W = latents.shape # 1, 4, 32, 32
-
         latents = latents.view(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
         latents = latents.permute(0, 2, 4, 1, 3, 5).contiguous()
         latents = latents.view(B, -1, C * self.patch_size * self.patch_size)
@@ -37,7 +36,7 @@ class ModelWrapper(torch.nn.Module):
             x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
             return x.view(B, C, H, W)
 
-        loss, loss_dict, denoised_tokens, noise, flow, pred_flow, noised_image = self.model(text=text, modality_tokens=modality_tokens, modality_positions=modality_positions, times=times, return_loss=return_loss)
+        loss, loss_dict, denoised_tokens, noise, flow, pred_flow, noised_image = self.model(text=text, modality_tokens=modality_tokens, modality_positions=modality_positions, times=times, return_loss=return_loss, num_inference_steps=num_inference_steps, start_timestep=start_timestep)
 
         # Unpatchify all relevant tensors
         unpatchified = unpatchify(denoised_tokens)
