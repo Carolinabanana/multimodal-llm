@@ -413,14 +413,16 @@ class Transformer(Module):
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict(),
         model_name: Optional[str] = None,
+        gradient_checkpointing: bool = False
     ):
         super().__init__()
-        
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.model_name = model_name
         if model_name is not None:
             self.pretrained_model = AutoModelForCausalLM.from_pretrained(model_name)
-            self.pretrained_model.gradient_checkpointing_enable()
+            if gradient_checkpointing:
+                self.pretrained_model.gradient_checkpointing_enable()
             self.pretrained_model.train()
             dim = self.pretrained_model.config.hidden_size
 
@@ -483,9 +485,11 @@ class Transformer(Module):
             is_any_modality = modality_positions_to_is_modality_mask(seq_len, modality_positions).any(dim = 1)
 
         if self.model_name is not None:
-            x = self.pretrained_model(inputs_embeds=x, attention_mask=attn_mask.float().unsqueeze(1), output_hidden_states=True).hidden_states[-1]
 
+            attn_mask = attn_mask.float().masked_fill(attn_mask == 0, float('-inf')).masked_fill(attn_mask == 1, 0.0).unsqueeze(1)
+            x = self.pretrained_model(inputs_embeds=x, attention_mask=attn_mask, output_hidden_states=True).hidden_states[-1]
             return x
+        
         else:
             adaptive_kwargs = dict(cond = cond, is_any_modality = is_any_modality)
 

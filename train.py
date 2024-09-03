@@ -19,7 +19,7 @@ def train():
     parser = argparse.ArgumentParser(description='Train the Transfusion model')
     parser.add_argument('--resume', action='store_true', help='Resume training from checkpoint')
     parser.add_argument('--model_name', type=str, default='HuggingFaceTB/SmolLM-1.7B', help='Name of the model to use')
-    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for training')
+    parser.add_argument('--learning_rate', type=float, default=7e-5, help='Learning rate for training')
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--image_size', type=int, default=256, help='Image size for training')
     parser.add_argument('--patch_size', type=int, default=2, help='Patch size for training')
