@@ -1,6 +1,6 @@
 import os
 import torch
-from data import TransfusionDataset, create_text_image_pairs, load_checkpoint, load_pairs_from_disk, resume_checkpoint, save_checkpoint, save_pairs_to_disk
+from data import CachedDataset, TransfusionDataset, create_text_image_pairs, load_checkpoint, load_pairs_from_disk, resume_checkpoint, save_checkpoint, save_pairs_to_disk
 from transfusion import Transfusion
 from transformers import AutoTokenizer
 from torch.optim import AdamW
@@ -29,6 +29,7 @@ def train():
     parser.add_argument('--debug_steps', type=int, default=100, help='Number of steps to debug')
     parser.add_argument('--inference_steps', type=int, default=200, help='Number of steps to inference')
     parser.add_argument('--save_steps', type=int, default=1000, help='Number of steps to save')
+    parser.add_argument('--cache', action='store_true', help='Recache the dataset')
 
     args = parser.parse_args()
     model_name = args.model_name
@@ -94,8 +95,28 @@ def train():
     print(f"Loaded {len(text_image_pairs)} text-image pairs")
 
     dataset = TransfusionDataset(text_image_pairs, tokenizer, model, max_length=max_length, image_size=image_size, device=device)
+    
+    # Cache the dataset
+    cache_dir = 'dataset_cache'
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    if args.cache or not os.path.exists(cache_dir) or len(os.listdir(cache_dir)) == 0:
+        temp_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        
+        for i, batch in enumerate(tqdm(temp_dataloader, desc="Caching dataset")):
+            cache_file = os.path.join(cache_dir, f'batch_{batch_size}_{i}.pt')
+            torch.save(batch, cache_file)
+    else:
+        print("Using existing cached dataset.")
 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+    cached_dataset = CachedDataset(cache_dir, batch_size)
+    dataloader = DataLoader(cached_dataset, batch_size=1, shuffle=True, num_workers=0)
+
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+    else:
+        torch.mps.empty_cache()
 
     optimizer = AdamWScheduleFree(model.parameters(), lr=learning_rate, foreach=torch.cuda.is_available(), warmup_steps=warmup_steps)
     optimizer.train()
@@ -115,15 +136,12 @@ def train():
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     # Sample for inference
-    sample_text = next(iter(dataloader))['input_ids'][0].unsqueeze(0).to(device)
-    sample_latents = next(iter(dataloader))['image_latents'][0].unsqueeze(0).to(device)
-
-    # Decode the sample latents using the VAE
-    decoded_sample_latents = vae_decode(sample_latents, model.vae)
+    sample_batch = torch.load(os.path.join(cache_dir, cached_dataset.cache_files[0]))
+    sample_text = sample_batch['input_ids'][0].unsqueeze(0).to(device)
+    sample_latents = sample_batch['image_latents'][0].unsqueeze(0).to(device)
 
     # Create a folder to save the decoded sample latents if it doesn't exist
     os.makedirs('inference_results', exist_ok=True)
-    decoded_sample_latents.save(f'inference_results/sample_latents_epoch_0.png')
     
     # Add noise to the sample latents
     noise = torch.randn_like(sample_latents)
@@ -142,9 +160,9 @@ def train():
         for i, batch in enumerate(progress_bar, 1):
             step_counter += 1
             optimizer.zero_grad()
-            
-            text = batch['input_ids'].to(device)
-            latents = batch['image_latents'].to(device)
+
+            text = batch['input_ids'][0].to(device)
+            latents = batch['image_latents'][0].to(device)
 
             times = torch.rand((latents.shape[0], 1), device=device)
 

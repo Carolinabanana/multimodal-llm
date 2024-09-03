@@ -118,3 +118,15 @@ def load_checkpoint(model_path, model, optimizer, scheduler, device):
     print(f"Resuming from epoch {start_epoch} step {step_counter}")
 
     return model, optimizer, scheduler, start_epoch, step_counter
+
+# Create a new dataset that loads from cache
+class CachedDataset(Dataset):
+    def __init__(self, cache_dir, batch_size):
+        self.cache_files = sorted([f for f in os.listdir(cache_dir) if f.startswith(f'batch_{batch_size}_')])
+        self.cache_dir = cache_dir
+
+    def __len__(self):
+        return len(self.cache_files)
+
+    def __getitem__(self, idx):
+        return torch.load(os.path.join(self.cache_dir, self.cache_files[idx]))
