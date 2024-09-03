@@ -1,8 +1,9 @@
+from typing import List
 import torch
 import numpy as np
 from PIL import Image   
 
-def vae_encode(image:Image, size, vae):
+def to_tensor(image:Image, size):
     with torch.no_grad():
 
         width, height = image.size
@@ -27,7 +28,16 @@ def vae_encode(image:Image, size, vae):
         image_np = (image_np - 0.5) * 2.0
         
         # Convert the image to a PyTorch tensor
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).to(vae.device)
+        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1)
+        
+        # Encode the image using the VAE
+        
+        return image_tensor
+
+def vae_encode(image:Image, size, vae):
+    with torch.no_grad():
+
+        image_tensor = to_tensor(image, size).to(vae.device)
         
         # Encode the image using the VAE
         
@@ -36,6 +46,21 @@ def vae_encode(image:Image, size, vae):
 
     return encoded_image
 
+def vae_encode_batch(images: torch.Tensor, vae, vae_batch_size: int):
+    batch_size = images.shape[0]
+    assert vae_batch_size <= batch_size, "VAE batch size must be less than or equal to the total batch size"
+    
+    encoded_images = []
+    images = images.to(vae.device)
+    
+    with torch.no_grad():
+        for i in range(0, batch_size, vae_batch_size):
+            sub_batch = images[i:i+vae_batch_size]
+            encoded_sub_batch = vae.encode(sub_batch).latent_dist.sample() * vae.config.scaling_factor
+            encoded_images.append(encoded_sub_batch)
+    
+    # Combine all encoded sub-batches into a single tensor
+    return torch.cat(encoded_images, dim=0)
 
 def vae_decode(latent, vae):
 

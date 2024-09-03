@@ -6,12 +6,13 @@ from transformers import AutoTokenizer
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from diffusers import AutoencoderKL
-from vae import vae_decode
+from vae import vae_decode, vae_encode_batch
 from wrapper import ModelWrapper
 import argparse
 from tqdm import tqdm
 from inference import debug_image, inference
 from schedulefree import AdamWScheduleFree
+from bitsandbytes.optim import AdamW8bit
 from accelerate import Accelerator
 
 def train():
@@ -28,7 +29,7 @@ def train():
     parser.add_argument('--max_length', type=int, default=64, help='Max length for the input text')
     parser.add_argument('--debug_steps', type=int, default=100, help='Number of steps to debug')
     parser.add_argument('--inference_steps', type=int, default=200, help='Number of steps to inference')
-    parser.add_argument('--save_steps', type=int, default=1000, help='Number of steps to save')
+    parser.add_argument('--save_steps', type=int, default=500, help='Number of steps to save')
     parser.add_argument('--cache', action='store_true', help='Recache the dataset')
 
     args = parser.parse_args()
@@ -89,37 +90,36 @@ def train():
 
 
     if not os.path.isfile("pairs.pkl"):
-        pairs = create_text_image_pairs("source")
+        pairs = create_text_image_pairs(["source"])
         save_pairs_to_disk(pairs,"pairs.pkl")
     text_image_pairs = load_pairs_from_disk('pairs.pkl')
     print(f"Loaded {len(text_image_pairs)} text-image pairs")
 
     dataset = TransfusionDataset(text_image_pairs, tokenizer, model, max_length=max_length, image_size=image_size, device=device)
-    
+
+    torch.cuda.empty_cache()
     # Cache the dataset
     cache_dir = 'dataset_cache'
     os.makedirs(cache_dir, exist_ok=True)
-    
+
     if args.cache or not os.path.exists(cache_dir) or len(os.listdir(cache_dir)) == 0:
-        temp_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-        
+        temp_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+
         for i, batch in enumerate(tqdm(temp_dataloader, desc="Caching dataset")):
+            batch["image_latents"] = vae_encode_batch(batch["pixel_values"], vae, vae_batch_size=32)
+            del batch["pixel_values"]
+
             cache_file = os.path.join(cache_dir, f'batch_{batch_size}_{i}.pt')
             torch.save(batch, cache_file)
     else:
         print("Using existing cached dataset.")
 
-
     cached_dataset = CachedDataset(cache_dir, batch_size)
-    dataloader = DataLoader(cached_dataset, batch_size=1, shuffle=True, num_workers=0)
+    dataloader = DataLoader(cached_dataset, batch_size=1, shuffle=True, num_workers=8)
 
-    if device == 'cuda':
-        torch.cuda.empty_cache()
-    else:
-        torch.mps.empty_cache()
-
-    optimizer = AdamWScheduleFree(model.parameters(), lr=learning_rate, foreach=torch.cuda.is_available(), warmup_steps=warmup_steps)
-    optimizer.train()
+    #optimizer = AdamWScheduleFree(model.parameters(), lr=learning_rate, foreach=torch.cuda.is_available(), warmup_steps=warmup_steps)
+    #optimizer.train()
+    optimizer = AdamW8bit(model.parameters(), lr=learning_rate)
 
     # Add LR scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs * len(dataloader) / batch_size, eta_min=1e-6)
@@ -140,8 +140,12 @@ def train():
     sample_text = sample_batch['input_ids'][0].unsqueeze(0).to(device)
     sample_latents = sample_batch['image_latents'][0].unsqueeze(0).to(device)
 
+    # Decode the sample latents using the VAE
+    decoded_sample_latents = vae_decode(sample_latents, model.vae)
+
     # Create a folder to save the decoded sample latents if it doesn't exist
     os.makedirs('inference_results', exist_ok=True)
+    decoded_sample_latents.save(f'inference_results/sample_latents_epoch_0.png')
     
     # Add noise to the sample latents
     noise = torch.randn_like(sample_latents)
@@ -151,16 +155,14 @@ def train():
     diffusion_loss_window = []
 
     for epoch in range(start_epoch, num_epochs):
-        epoch_loss = 0
         epoch_text_loss = 0
         epoch_diffusion_loss = 0
-        num_batches = len(dataloader)
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/10", leave=False)
         for i, batch in enumerate(progress_bar, 1):
             step_counter += 1
             optimizer.zero_grad()
-
+            
             text = batch['input_ids'][0].to(device)
             latents = batch['image_latents'][0].to(device)
 
@@ -213,3 +215,5 @@ def train():
 if __name__ == '__main__':
     train() 
 
+
+#8bit 7e-5 batch 32 step 10 - 0.62

@@ -5,7 +5,7 @@ import torch
 from torchvision import transforms
 from torch.utils.data import Dataset
 
-from vae import vae_encode
+from vae import to_tensor, vae_encode
 
 class TransfusionDataset(Dataset):
     def __init__(self, text_image_pairs, tokenizer, model, max_length, image_size, device):
@@ -28,12 +28,13 @@ class TransfusionDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         
         # Load and process image
-        image_latents = vae_encode(image, (self.image_size, self.image_size), self.model.vae)  
+        #image_latents = vae_encode(image, (self.image_size, self.image_size), self.model.vae) 
+        pixel_values = to_tensor(image, (self.image_size, self.image_size)) 
         
         return {
             "input_ids": tokenized_text.input_ids.squeeze(),
             "attention_mask": tokenized_text.attention_mask.squeeze(),
-            "image_latents": image_latents
+            "pixel_values": pixel_values
         }
     
 def encode_text(text, tokenizer, model, max_length):
@@ -53,29 +54,30 @@ def encode_text(text, tokenizer, model, max_length):
     return tokenized_text
 
     
-def create_text_image_pairs(folder_path):
+def create_text_image_pairs(folder_paths):
     text_image_pairs = []
     
     # List all files in the folder
-    files = os.listdir(folder_path)
+    for folder_path in folder_paths:
+        files = os.listdir(folder_path)
 
-    # Iterate through the files
-    for file in files:
-        # Check if the file is an image (png or jpg)
-        if file.lower().endswith(('.png', '.jpg', '.jpeg','.webp')):
-            # Get the file name without extension
-            base_name = os.path.splitext(file)[0]
-            
-            # Check if a corresponding text file exists
-            txt_file = base_name + '.txt'
-            if txt_file in files:
-                # Read the content of the text file
-                with open(os.path.join(folder_path, txt_file), 'r') as f:
-                    text_content = f.read().strip()
+        # Iterate through the files
+        for file in files:
+            # Check if the file is an image (png or jpg)
+            if file.lower().endswith(('.png', '.jpg', '.jpeg','.webp')):
+                # Get the file name without extension
+                base_name = os.path.splitext(file)[0]
                 
-                # Create the pair and add it to the list
-                image_path = os.path.join(folder_path, file)
-                text_image_pairs.append((text_content, image_path))
+                # Check if a corresponding text file exists
+                txt_file = base_name + '.txt'
+                if txt_file in files:
+                    # Read the content of the text file
+                    with open(os.path.join(folder_path, txt_file), 'r') as f:
+                        text_content = f.read().strip()
+                    
+                    # Create the pair and add it to the list
+                    image_path = os.path.join(folder_path, file)
+                    text_image_pairs.append((text_content, image_path))
     
     return text_image_pairs
 
@@ -88,7 +90,7 @@ def load_pairs_from_disk(filename):
         pairs = pickle.load(f)
     return pairs
 
-def save_checkpoint(model, optimizer, loss, epoch, step_counter):
+def save_checkpoint(model, optimizer, scheduler, loss, epoch, step_counter):
     print(f"Saving model at step {step_counter}...")
     os.makedirs('checkpoints', exist_ok=True)
     torch.save({

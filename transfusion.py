@@ -632,13 +632,18 @@ class Transfusion(Module):
                 dn = (1.0 - start_timestep) / num_inference_steps
                 flow = torch.zeros_like(modality_tokens)
                 noised_image = modality_tokens.clone().detach()
+                noise = torch.randn_like(modality_tokens)
+                times = torch.full((batch,1), start_timestep, device=modality_tokens.device)
+                padded_times = rearrange(times, 'b n -> b n 1')
+                modality_tokens = modality_tokens * padded_times + noise * (1. - padded_times)
+
+                print(start_timestep, steps, padded_times)
 
                 for step in tqdm(steps, desc="Inference", leave=False):
                     
                     times = torch.full((batch,1), step, device=modality_tokens.device)
                     times = einsum(is_modalities.float(), times, 'b m n, b m -> b n')
-                    padded_times = rearrange(times, 'b n -> b n 1')
-                    noise = torch.randn_like(modality_tokens)
+                    
 
                     modality_tokens_hidden = self.to_hidden(modality_tokens)
 
