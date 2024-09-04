@@ -10,6 +10,8 @@ from PIL import Image
 def inference(model, optimizer, text, latents, save_path, steps=50, start_timestep=0.7):
         with torch.no_grad():
             model.eval()
+            if torch.cuda.is_available():
+                 optimizer.eval()
 
             #todo add noise before inference loop
             _, _, denoised_tokens, _, _, _, _ = model(text=text, latents=latents, num_inference_steps=steps, return_loss=False, start_timestep=start_timestep)
@@ -23,6 +25,8 @@ def inference(model, optimizer, text, latents, save_path, steps=50, start_timest
             decoded_images.save(save_path)
             print("Inference complete.")
             model.train()
+            if torch.cuda.is_available():
+                 optimizer.train()
 
 def debug_image(model, image_patches, noise, predicted_noise, target_noise, noisy_latent, denoised_image, epoch, step_counter):
 

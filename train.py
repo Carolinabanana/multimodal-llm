@@ -12,7 +12,6 @@ import argparse
 from tqdm import tqdm
 from inference import debug_image, inference
 from schedulefree import AdamWScheduleFree
-from bitsandbytes.optim import AdamW8bit
 from accelerate import Accelerator
 
 def train():
@@ -27,9 +26,9 @@ def train():
     parser.add_argument('--gradient_checkpointing', action='store_true', help='Use gradient checkpointing')
     parser.add_argument('--diffusion_loss_weight', type=float, default=5, help='Weight for the diffusion loss')
     parser.add_argument('--max_length', type=int, default=64, help='Max length for the input text')
-    parser.add_argument('--debug_steps', type=int, default=100, help='Number of steps to debug')
-    parser.add_argument('--inference_steps', type=int, default=200, help='Number of steps to inference')
-    parser.add_argument('--save_steps', type=int, default=500, help='Number of steps to save')
+    parser.add_argument('--debug_steps', type=int, default=250, help='Number of steps to debug')
+    parser.add_argument('--inference_steps', type=int, default=500, help='Number of steps to inference')
+    parser.add_argument('--save_steps', type=int, default=1000, help='Number of steps to save')
     parser.add_argument('--cache', action='store_true', help='Recache the dataset')
 
     args = parser.parse_args()
@@ -86,8 +85,6 @@ def train():
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total model parameters: {total_params}")
-    
-
 
     if not os.path.isfile("pairs.pkl"):
         pairs = create_text_image_pairs(["source"])
@@ -103,10 +100,10 @@ def train():
     os.makedirs(cache_dir, exist_ok=True)
 
     if args.cache or not os.path.exists(cache_dir) or len(os.listdir(cache_dir)) == 0:
-        temp_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+        temp_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8, multiprocessing_context='fork' if torch.backends.mps.is_available() else None)
 
         for i, batch in enumerate(tqdm(temp_dataloader, desc="Caching dataset")):
-            batch["image_latents"] = vae_encode_batch(batch["pixel_values"], vae, vae_batch_size=32)
+            batch["image_latents"] = vae_encode_batch(batch["pixel_values"], vae, vae_batch_size=batch_size)
             del batch["pixel_values"]
 
             cache_file = os.path.join(cache_dir, f'batch_{batch_size}_{i}.pt')
@@ -117,9 +114,12 @@ def train():
     cached_dataset = CachedDataset(cache_dir, batch_size)
     dataloader = DataLoader(cached_dataset, batch_size=1, shuffle=True, num_workers=8)
 
-    #optimizer = AdamWScheduleFree(model.parameters(), lr=learning_rate, foreach=torch.cuda.is_available(), warmup_steps=warmup_steps)
-    #optimizer.train()
-    optimizer = AdamW8bit(model.parameters(), lr=learning_rate)
+    if torch.cuda.is_available():
+        from bitsandbytes.optim import AdamW8bit
+        optimizer = AdamW8bit(model.parameters(), lr=learning_rate)
+    else:
+        optimizer = AdamWScheduleFree(model.parameters(), lr=learning_rate, foreach=torch.cuda.is_available(), warmup_steps=warmup_steps)
+        optimizer.train()
 
     # Add LR scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs * len(dataloader) / batch_size, eta_min=1e-6)

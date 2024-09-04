@@ -106,7 +106,7 @@ def resume_checkpoint(model, optimizer, scheduler, device):
     checkpoint_files = [f for f in os.listdir('./checkpoints') if f.startswith('model_checkpoint_epoch_') and f.endswith('.pth')]
     if checkpoint_files:
         latest_checkpoint = max(checkpoint_files)
-        load_checkpoint(f'./checkpoints/{latest_checkpoint}', model, optimizer, scheduler, device)
+        return load_checkpoint(f'./checkpoints/{latest_checkpoint}', model, optimizer, scheduler, device)
 
 def load_checkpoint(model_path, model, optimizer, scheduler, device):
     print(f"Loading checkpoint: {model_path}")
@@ -114,7 +114,7 @@ def load_checkpoint(model_path, model, optimizer, scheduler, device):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     #optimizer.load_state_dict(checkpoint['optimizer_state_dict']) if optimizer is not None else None
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict']) if scheduler is not None else None
+    #scheduler.load_state_dict(checkpoint['scheduler_state_dict']) if scheduler is not None else None
     start_epoch = checkpoint['epoch'] + 1
     step_counter = checkpoint['step_counter']
     print(f"Resuming from epoch {start_epoch} step {step_counter}")
@@ -131,4 +131,4 @@ class CachedDataset(Dataset):
         return len(self.cache_files)
 
     def __getitem__(self, idx):
-        return torch.load(os.path.join(self.cache_dir, self.cache_files[idx]))
+        return torch.load(os.path.join(self.cache_dir, self.cache_files[idx]), map_location=torch.device('cpu'))
