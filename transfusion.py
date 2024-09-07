@@ -1,34 +1,11 @@
-"""
-Copyright (c) 2024 Phil Wang
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-"""
 from __future__ import annotations
-from typing import Optional
-
-from tqdm import tqdm
 
 """
 global ein notation
 
 b - batch
-m - modalities
+t - one modality type
+m - separate modality instance
 n - sequence
 d - dimension
 l - logits (text)
@@ -36,30 +13,43 @@ i, j - sequence (row, col)
 """
 
 from functools import partial
-from collections import namedtuple
+from typing import NamedTuple
 
 import torch
 from torch import nn, Tensor, tensor
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList
+from torch.nn import Module, ModuleList, Linear
 from torch.nn.utils.rnn import pad_sequence
 
 import einx
 from einops import rearrange, repeat, reduce, einsum, pack
 from einops.layers.torch import Rearrange
 
-from tensor_typing import Float, Int, Bool
+from transfusion_pytorch.tensor_typing import Float, Int, Bool
 
-from transformers import AutoModelForCausalLM
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+
+from tqdm import tqdm
 
 pad_sequence = partial(pad_sequence, batch_first = True)
 
+# maybe flex attention
+
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+except ImportError:
+    flex_attention = None
+
 # constants
+
+ModalitySample = list[Int['_'] | Float['_ _'] | tuple[int, Float['_ _']]]
 
 RawModalityPositions = list[list[tuple[int, int]]]
 
-LossBreakdown = namedtuple('LossBreakdown', ['total', 'text', 'diffusion'])
+class LossBreakdown(NamedTuple):
+    total: Float['']
+    text: Float['']
+    diffusion: list[Float['']]
 
 # helper functions
 
@@ -69,8 +59,17 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t):
+    return t
+
+def first(it):
+    return it[0]
+
 def divisible_by(num, den):
     return (num % den) == 0
+
+def cast_tuple(t, length = 1):
+    return t if isinstance(t, tuple) else ((t,) * length)
 
 # tensor helpers
 
@@ -89,22 +88,32 @@ def causal(b, h, q_idx, kv_idx):
 def modality(offset, length):
 
     def mask_fn(b, h, q_idx, kv_idx):
-        return q_idx >= offset & kv_idx < (offset + length)
+        return (q_idx >= offset) & (kv_idx < (offset + length))
 
     return mask_fn
 
-def transfusion_attn_mask(modalities: list[tuple[int, int]]):
+def transfusion_attn_mask(modalities: Int['b m 3']):
+    modalities = modalities.long()
 
-    def mask_mod(*args):
-        is_causal = causal(*args)
+    def mask_mod(b, h, q_idx, kv_idx):
+        mask = causal(b, h, q_idx, kv_idx)
 
-        modality_mask_mods = [modality(*modality_coors_info) for modality_coors_info in modalities]
+        modality_batch = modalities[b]
 
-        is_modality = any([fn(*args) for fn in modality_mask_mods])
+        for _, offset, length in modality_batch:
+            mask = mask | modality(offset, length)(b, h, q_idx, kv_idx)
 
-        return is_causal | is_modality
+        return mask
 
     return mask_mod
+
+def softcap_score_mod(softcap):
+    def inner(score, b, h, q_idx, kv_idx):
+        score = score / softcap
+        score = torch.tanh(score)
+        score = score * softcap
+        return score
+    return inner
 
 # converting a raw list of modality offsets and lengths to tensor
 
@@ -112,19 +121,23 @@ def modality_positions_to_tensor(
     modalities: RawModalityPositions,
     pad_value = 0,
     device = None
-) -> Int['b m 2']:
+) -> Int['b m 2'] | Int['b m 3']:
 
     modalities: list[Tensor] = [tensor(modality, device = device) for modality in modalities]
     modalities = pad_sequence(modalities, padding_value = pad_value)
+
+    if modalities.ndim == 2:
+        modalities = modalities.reshape(*modalities.shape, 3)
+
     return modalities
 
 # sanitizing modalities tensor, making sure it is ordered
 
 def order_modality_positions_by_seq_offset(
-    modalities: Int['b m 2']
-) -> tuple[Int['b m 2'], Int['b m']]:
+    modalities: Int['b m 3']
+) -> tuple[Int['b m 3'], Int['b m']]:
 
-    offsets, lengths = modalities.unbind(dim = -1)
+    type, offsets, lengths = modalities.unbind(dim = -1)
 
     no_modality_mask = lengths <= 0 # there may be uneven number of modalities per batch sample
     offsets_to_sort = offsets.masked_fill(no_modality_mask, 1e10)
@@ -133,7 +146,11 @@ def order_modality_positions_by_seq_offset(
     # sort by ascending offset and do a final mask of both offset and length to 0
 
     modalities = einx.get_at('b [mi] ..., b mo -> b mo ...', modalities, sorted_indices)
-    modalities = einx.where('b m, b m ..., -> b m ...', ~no_modality_mask, modalities, 0.)
+    modalities = einx.where('b m ..., b m ..., -> b m ...', torch.stack([
+        torch.ones_like(type, dtype=torch.bool),
+        ~no_modality_mask,
+        ~no_modality_mask
+    ], dim=-1), modalities, 0)
 
     return modalities, sorted_indices
 
@@ -144,15 +161,15 @@ def order_modality_positions_by_seq_offset(
 
 def derive_rotary_positions_from_modality_positions(
     seq_len: int,
-    modalities: Int['b m 2']
+    modalities: Int['b m 3']
 ) -> Int['b n']:
 
     device = modalities.device
 
     modality_mask = modality_positions_to_is_modality_mask(seq_len, modalities, offset = torch.tensor([1, -1]))
-    is_any_modality = modality_mask.any(dim = 1)
+    is_any_modality = reduce(modality_mask, 'b t m n -> b n', 'any')
 
-    return torch.arange(seq_len, device = device).unsqueeze(0).expand(modalities.shape[0], -1) #- is_any_modality.cumsum(dim = -1)
+    return torch.arange(seq_len, device = device) - is_any_modality.cumsum(dim = -1)
 
 # modality tokens are given as list of tensors, can be then be embedded into the modality tokens for attending alongside text tokens
 
@@ -160,7 +177,8 @@ def embed_modality_tokens(
     seq_len: int,
     dim: int,
     modality_tokens: list[list[Float['_ d']]],
-    modalities: Int['b m 2']
+    modalities: Int['b m 3'],
+    modality_id: int
 ) -> Float['b n d']:
 
     batch, device = modalities.shape[0], modalities.device
@@ -168,13 +186,15 @@ def embed_modality_tokens(
     output = torch.zeros((batch, seq_len, dim), device = device)
 
     for batch_ind, (one_modality, one_modality_token) in enumerate(zip(modalities, modality_tokens)):
-        for (offset, length), batch_modality_token in zip(one_modality, one_modality_token):
-            if length <= 0:
+        for (type, offset, length), batch_modality_token in zip(one_modality, one_modality_token):
+
+            if modality_id != type or length <= 0:
                 continue
 
             modality_shape = batch_modality_token.shape
 
-            assert length == modality_shape[1], f'received a modality of shape {modality_shape} but sequence length in modalities info is {length}'
+            assert length == modality_shape[0], f'received a modality of shape {modality_shape} but sequence length in modalities info is {length}'
+            assert dim == modality_shape[1], f'received modality [{modality_id}] with shape {modality_shape} but expected dimension of {dim}'
 
             output[batch_ind, offset:(offset + length)] = batch_modality_token
 
@@ -184,38 +204,41 @@ def embed_modality_tokens(
 
 def modality_positions_to_is_modality_mask(
     seq_len: int,
-    modalities: RawModalityPositions | Int['b m 2'],
+    modalities: Int['b m 3'],
     offset: Int['2'] | None = None,
-    device = None
-) -> Bool['b m n']:
+    device = None,
+    num_modalities = 1
+) -> Bool['b t m n']:
 
-    if isinstance(modalities, list):
-        modalities = modality_positions_to_tensor(modalities, device = device)
+    device = modalities.device
 
     if exists(offset):
+        offset = F.pad(offset, (1, 0))
         modalities = modalities + offset.to(modalities)
 
-    left, right = modalities.cumsum(dim = -1).unbind(dim = -1)
+    seq = torch.arange(seq_len, device = device)
+    type_seq = torch.arange(num_modalities, device = device)
 
-    seq = torch.arange(seq_len, device = modalities.device)
+    modality_types = modalities[..., 0]
 
-    is_modality = (
+    left, right = modalities[..., 1:].cumsum(dim = -1).unbind(dim = -1)
+
+    is_instance_for_type = einx.equal('b m, t -> b t m', modality_types, type_seq)
+
+    is_modality_along_seq = (
         einx.greater_equal('i, b m -> b m i', seq, left) &
         einx.less('j, b m -> b m j', seq, right)
     )
 
-    return is_modality
+    return einx.logical_and('b t m, b m n -> b t m n', is_instance_for_type, is_modality_along_seq)
 
 def naive_attn_mask(
     seq_len: int,
-    modalities: RawModalityPositions | Int['b m 2'],
+    modalities: Int['b m 3'],
     device = None
 ) -> Bool['b i j']:
 
-    if isinstance(modalities, list):
-        modalities = modalities_to_tensor(modalities)
-
-    offsets, length = modalities.unbind(dim = -1)
+    _, offsets, length = modalities.unbind(dim = -1)
 
     seq = torch.arange(seq_len, device = device)
 
@@ -227,6 +250,20 @@ def naive_attn_mask(
     )
 
     return is_causal | is_modality.any(dim = 1)
+
+# sampling related functions
+
+# min_p for text
+# https://arxiv.org/abs/2407.01082
+
+def min_p_filter(logits, min_p = 0.1):
+    probs = logits.softmax(dim = -1)
+    max_probs = probs.amax(dim = -1, keepdim = True)
+    limit = min_p * max_probs
+    return torch.where(probs < limit, float('-inf'), logits)
+
+
+from torchdiffeq import odeint
 
 # random fourier embedding
 
@@ -268,12 +305,12 @@ class AdaptiveWrapper(Module):
         # and for output will use layerscale
 
         self.layernorm_gamma = nn.Parameter(torch.zeros(dim))
-        self.layerscale = nn.Parameter(torch.ones(dim))
+        self.layerscale = nn.Parameter(torch.zeros(dim))
 
         # modalities will get the adaptive layernorm + ada-ln zero
 
-        self.to_film = nn.Linear(dim_cond, dim * 2)
-        self.to_ada_ln_zero = nn.Linear(dim_cond, dim)
+        self.to_film = Linear(dim_cond, dim * 2)
+        self.to_ada_ln_zero = Linear(dim_cond, dim)
 
         nn.init.zeros_(self.to_film.weight)
         nn.init.zeros_(self.to_ada_ln_zero.weight)
@@ -306,7 +343,7 @@ class AdaptiveWrapper(Module):
 
         # take care of conditioning output separately for text vs modality
 
-        text_out = out * self.layerscale
+        text_out = out * (self.layerscale + 1.)
         modalities_out = out * self.to_ada_ln_zero(cond).sigmoid()
 
         return torch.where(is_any_modality, modalities_out, text_out)
@@ -335,10 +372,10 @@ def FeedForward(
     dim_inner = int(dim * expansion_factor * 2 / 3)
     return nn.Sequential(
         RMSNorm(dim),
-        nn.Linear(dim, dim_inner * 2),
+        Linear(dim, dim_inner * 2),
         GEGLU(),
         nn.Dropout(dropout),
-        nn.Linear(dim_inner, dim)
+        Linear(dim_inner, dim)
     )
 
 class Attention(Module):
@@ -349,15 +386,19 @@ class Attention(Module):
         heads = 8,
         dropout = 0.,
         softcap_value = 50.,
+        use_flex_attn = False
     ):
         super().__init__()
         self.scale = dim_head ** -0.5
         dim_inner = dim_head * heads
 
+        assert not (use_flex_attn and not exists(flex_attention)), 'flex attention is only available on torch 2.5.0 (nightly) onwards'
+        self.use_flex_attn = use_flex_attn
+
         self.norm = RMSNorm(dim)
 
         self.to_qkv = nn.Sequential(
-            nn.Linear(dim, dim_inner * 3, bias = False),
+            Linear(dim, dim_inner * 3, bias = False),
             Rearrange('b n (qkv h d) -> qkv b h n d', qkv = 3, h = heads)
         )
 
@@ -367,36 +408,55 @@ class Attention(Module):
 
         self.to_out = nn.Sequential(
             Rearrange('b h n d -> b n (h d)'),
-            nn.Linear(dim_inner, dim, bias = False)
+            Linear(dim_inner, dim, bias = False)
         )
 
     def forward(
         self,
         x,
-        attn_mask = None,
-        rotary_emb: Tensor | None = None
+        attn_mask: Tensor | None = None,
+        rotary_emb: Tensor | None = None,
+        block_mask = None,
     ):
+        assert not (exists(block_mask) and exists(attn_mask))
+
         x = self.norm(x)
 
         q, k, v = self.to_qkv(x)
 
+        # rotary embeddings
+
         if exists(rotary_emb):
             q, k = tuple(apply_rotary_emb(rotary_emb, t) for t in (q, k))
 
-        q = q * self.scale
-        sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+        # whether to use flex attention or not
 
-        sim = softclamp(sim, self.softcap_value)
+        if self.use_flex_attn:
 
-        if exists(attn_mask):
-            mask_value = -torch.finfo(sim.dtype).max
-            sim = einx.where('b i j, b h i j, -> b h i j', attn_mask, sim, mask_value)
+            flex_attn_kwargs = dict(block_mask = block_mask)
 
-        attn = sim.softmax(dim = -1)
+            if self.softcap_value > 0.:
+                flex_attn_kwargs.update(score_mod = softcap_score_mod(self.softcap_value))
 
-        attn = self.dropout(attn)
+            out = flex_attention(q, k, v, **flex_attn_kwargs)
 
-        out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+        else:
+            q = q * self.scale
+            sim = einsum(q, k, 'b h i d, b h j d -> b h i j')
+
+            sim = softclamp(sim, self.softcap_value)
+
+            if exists(attn_mask):
+                mask_value = -torch.finfo(sim.dtype).max
+                sim = einx.where('b i j, b h i j, -> b h i j', attn_mask, sim, mask_value)
+
+            attn = sim.softmax(dim = -1)
+
+            attn = self.dropout(attn)
+
+            out = einsum(attn, v, 'b h i j, b h j d -> b h i d')
+
+        # combine heads and out
 
         return self.to_out(out)
 
@@ -412,49 +472,34 @@ class Transformer(Module):
         ff_expansion_factor = 4,
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict(),
-        model_name: Optional[str] = None,
-        gradient_checkpointing: bool = False
+        use_flex_attn = False
     ):
         super().__init__()
-        self.gradient_checkpointing = gradient_checkpointing
-
-        self.model_name = model_name
-        if model_name is not None:
-            self.pretrained_model = AutoModelForCausalLM.from_pretrained(model_name)
-            if gradient_checkpointing:
-                self.pretrained_model.gradient_checkpointing_enable()
-            self.pretrained_model.train()
-            dim = self.pretrained_model.config.hidden_size
-
-
-        else:
-
-            self.dim = dim
-            self.dim_head = dim_head
-
-            layers = ModuleList([])
-
-            for _ in range(depth):
-                attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = dropout, **attn_kwargs)
-
-                ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor, **ff_kwargs)
-
-                attn = AdaptiveWrapper(attn, dim = dim, dim_cond = dim * 4)
-                ff = AdaptiveWrapper(ff, dim = dim, dim_cond = dim * 4)
-
-                layers.append(ModuleList([attn, ff]))
-
-                self.layers = layers
-                self.norm = RMSNorm(dim)
+        self.use_flex_attn = use_flex_attn
 
         self.dim = dim
         self.dim_head = dim_head
-        
+
         self.to_time_cond = nn.Sequential(
             RandomFourierEmbed(dim),
-            nn.Linear(dim + 1, dim * 4),
+            Linear(dim + 1, dim * 4),
             nn.SiLU()
         )
+
+        layers = ModuleList([])
+
+        for _ in range(depth):
+            attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = dropout, use_flex_attn = use_flex_attn, **attn_kwargs)
+
+            ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor, **ff_kwargs)
+
+            attn = AdaptiveWrapper(attn, dim = dim, dim_cond = dim * 4)
+            ff = AdaptiveWrapper(ff, dim = dim, dim_cond = dim * 4)
+
+            layers.append(ModuleList([attn, ff]))
+
+        self.layers = layers
+        self.norm = RMSNorm(dim)
 
     def forward(
         self,
@@ -477,29 +522,31 @@ class Transformer(Module):
 
         # create the specialized mask needed for autoregressive text + bidirectional diffusion attention
 
+        attn_mask_kwargs = dict()
+
         if exists(modality_positions):
-            attn_mask = naive_attn_mask(seq_len, modality_positions, device = device)
+            if self.use_flex_attn:
+                transfusion_mask_fn = transfusion_attn_mask(modality_positions)
+                block_mask = create_block_mask(transfusion_mask_fn, B = None, H = None, Q_LEN = seq_len, KV_LEN = seq_len, device = device)
+                attn_mask_kwargs.update(block_mask = block_mask)
+            else:
+                attn_mask = naive_attn_mask(seq_len, modality_positions, device = device)
+                attn_mask_kwargs.update(attn_mask = attn_mask)
 
         if not exists(is_any_modality):
             assert exists(modality_positions)
             is_any_modality = modality_positions_to_is_modality_mask(seq_len, modality_positions).any(dim = 1)
+            is_any_modality = reduce(is_any_modality, 'b t n -> b n', 'any')
 
-        if self.model_name is not None:
+        adaptive_kwargs = dict(cond = cond, is_any_modality = is_any_modality)
 
-            attn_mask = attn_mask.float().masked_fill(attn_mask == 0, float('-inf')).masked_fill(attn_mask == 1, 0.0).unsqueeze(1)
-            x = self.pretrained_model(inputs_embeds=x, attention_mask=attn_mask, output_hidden_states=True).hidden_states[-1]
-            return x
-        
-        else:
-            adaptive_kwargs = dict(cond = cond, is_any_modality = is_any_modality)
+        # transformer layers as usual, using mask from above
 
-            # transformer layers as usual, using mask from above
+        for attn, ff in self.layers:
+            x = attn(x, rotary_emb = rotary_emb, **attn_mask_kwargs, **adaptive_kwargs) + x
+            x = ff(x, **adaptive_kwargs) + x
 
-            for attn, ff in self.layers:
-                x = attn(x, attn_mask = attn_mask, rotary_emb = rotary_emb, **adaptive_kwargs) + x
-                x = ff(x, **adaptive_kwargs) + x
-
-            return self.norm(x)
+        return self.norm(x)
 
 # classes
 
@@ -509,10 +556,15 @@ class Transfusion(Module):
         *,
         num_text_tokens,
         transformer: dict | Transformer,
+        dim_latent: int | tuple[int, ...] | None = None,
+        modality_token_transform: tuple[str | callable, ...] | None = None,
         ignore_index = -1,
         diffusion_loss_weight = 1.,
-        flattened_dim = 16,
-        gradient_checkpointing = False
+        odeint_kwargs: dict = dict(
+            atol = 1e-5,
+            rtol = 1e-5,
+            method = 'midpoint'
+        ),
     ):
         super().__init__()
 
@@ -522,8 +574,46 @@ class Transfusion(Module):
             transformer = Transformer(**transformer)
 
         self.transformer = transformer
-        dim, dim_head = transformer.dim, transformer.dim_head
+        dim = transformer.dim
+
         self.dim = dim
+
+        # latent and model dimension not the same
+        # make it work for 1 modality for now
+
+        dim_latent = default(dim_latent, dim)
+
+        self.dim_latents = cast_tuple(dim_latent)
+
+        # number of modalities
+
+        self.num_modalities = len(self.dim_latents)
+
+        # modality start and end tokens - termed [som] [eom] in this repo
+
+        num_som_eom_tokens = (self.num_modalities + 1) * 2
+        som_eom_tensor = torch.arange(num_som_eom_tokens) + num_text_tokens # shift to the very end
+        som_eom_tensor = rearrange(som_eom_tensor, '(be m) -> be m', be = 2)
+
+        text_start_end_tensor, modality_start_end_tensor = som_eom_tensor[:, 0], som_eom_tensor[:, 1:]
+
+        # modality start and end ids
+
+        self.som_ids, self.eom_ids = som_eom_tensor.tolist()
+
+        # entire "sentence" start and end id
+
+        self.sos_id, self.eos_id = text_start_end_tensor.tolist()
+
+        # modality transforms
+
+        modality_token_transform = cast_tuple(modality_token_transform, self.num_modalities)
+        modality_token_transform = [default(transform, identity) for transform in modality_token_transform]
+        self.modality_token_transform = [Rearrange(maybe_einops_eq) if isinstance(maybe_einops_eq, str) else maybe_einops_eq for maybe_einops_eq in modality_token_transform]
+
+        assert len(self.modality_token_transform) == self.num_modalities
+
+        self.latent_to_model_projs = ModuleList([Linear(dim_latent, dim) if dim_latent != dim else nn.Identity() for dim_latent in self.dim_latents])
 
         # relative positions
 
@@ -531,36 +621,136 @@ class Transfusion(Module):
 
         # embeddings and un-embeddings
 
-        self.text_embed = nn.Embedding(num_text_tokens, dim) if self.transformer.model_name is None else self.transformer.pretrained_model.model.embed_tokens
+        effective_num_text_tokens = num_text_tokens + num_som_eom_tokens
 
-        self.to_text_logits = nn.Linear(dim, num_text_tokens, bias = False)  if self.transformer.model_name is None else self.transformer.pretrained_model.lm_head
+        self.text_embed = nn.Embedding(effective_num_text_tokens, dim)
 
-        self.flattened_dim = flattened_dim
+        self.to_text_logits = Linear(dim, effective_num_text_tokens, bias = False)
 
-        self.to_hidden = nn.Linear(self.flattened_dim, dim, bias = False)
-
-        self.to_pred_flow = nn.Linear(dim, self.flattened_dim, bias = False)
-
-        self.gradient_checkpointing = gradient_checkpointing
+        self.model_to_latent_preds = ModuleList([Linear(dim, dim_latent, bias = False) for dim_latent in self.dim_latents])
 
         # loss related
 
         self.ignore_index = ignore_index
         self.diffusion_loss_weight = diffusion_loss_weight
 
+        # diffusion sampling related
+
+        self.odeint_fn = partial(odeint, **odeint_kwargs)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @torch.no_grad()
+    def sample(
+        self,
+        prompt: ModalitySample | None = None,
+        max_length = 8192,
+        text_temperature = 1.5,
+        text_min_p = 0.1,
+    ) -> ModalitySample:
+
+        was_training = self.training
+        self.eval()
+
+        seq = tensor([self.sos_id], device = self.device)
+
+        for _ in tqdm(range(max_length)):
+            logits = self.forward([[seq]], return_loss = False)
+            logits = logits[0][-1]
+
+            logits = min_p_filter(logits, min_p = text_min_p)
+            probs = (logits / text_temperature).softmax(dim = -1)
+
+            sampled = torch.multinomial(probs, 1)
+            seq = torch.cat((seq, sampled), dim = -1)
+
+            if sampled.item() == self.eos_id:
+                break
+
+        self.train(was_training)
+        return [seq]
+
     def forward(
         self,
-        text: Int['b n'],
-        modality_tokens: list[list[Float['_ d']]] | Float['b n d'],
-        modality_positions: RawModalityPositions | Int['b m 2'],
-        times: Float['b m'] | None = None,
+        modalities: list[ModalitySample],
+        times: (
+            Float['b m'] |
+            Callable[[Int['b m 3']], Float['b m']] | # allows a researcher to customize the times (noise level) based on the overall modality configuration of a sample
+            None
+        ) = None,
         return_loss = True,
-        num_inference_steps: int = 50,
-        start_timestep: float = 0.0
+        return_breakdown = False
     ) -> (
         Float['b n l'] |
+        Float[''] |
         tuple[Float[''], LossBreakdown]
     ):
+        device = self.device
+
+        # add "sentence" start and end tokens when training
+
+        if return_loss:
+            for modality in modalities:
+                modality.insert(0, tensor([self.sos_id], device = device))
+                modality.append(tensor([self.eos_id], device = device))
+
+        # process list of text and modalities interspersed with one another
+
+        modality_positions = []
+        modality_tokens = []
+        text = []
+
+        for batch_modalities in modalities:
+            batch_modality_positions = []
+            batch_modality_tokens = []
+            batch_text = []
+            offset = 0
+
+            for modality in batch_modalities:
+                # if non-text modality detected and not given as a tuple
+                # cast to (int, Tensor) where int is defaulted to type 0 (convenience for one modality)
+
+                if torch.is_tensor(modality) and modality.dtype == torch.float:
+                    modality = (0, modality)
+
+                is_text = not isinstance(modality, tuple)
+
+                if is_text:
+                    modality_tensor = modality
+                else:
+                    modality_type, modality_tensor = modality
+
+                    assert 0 <= modality_type < self.num_modalities, f'received a modality index that is out of range. only {self.num_modalities} modalities specified'
+                    assert self.dim_latents[modality_type] == modality_tensor.shape[-1], 'mismatch for modality latent dimension - expected {self.dim_latents[modality_type]} but received {modality_tensor.shape[-1]}'
+
+                length = modality_tensor.shape[0]
+
+                if is_text:
+                    batch_text.append(modality_tensor)
+                    offset += length
+                else:
+
+                    text_tensor = torch.full((length,), -1, device = device) # text is all -1 here, so text labels are not learned on
+
+                    # add the [som] and [eom] tokens for the modality type
+
+                    som_id, eom_id = self.som_ids[modality_type], self.eom_ids[modality_type]
+                    text_tensor = F.pad(text_tensor, (1, 0), value = som_id)
+                    text_tensor = F.pad(text_tensor, (0, 1), value = eom_id)
+
+                    batch_text.append(text_tensor)
+                    batch_modality_tokens.append(modality_tensor)
+                    batch_modality_positions.append((modality_type, offset + 1, length)) # offset + 1 due to extra [som] token
+
+                    offset += length + 2 # +2 due to [som] and [eom]
+
+            text.append(torch.cat(batch_text))
+            modality_tokens.append(batch_modality_tokens)
+            modality_positions.append(batch_modality_positions)
+
+        text = pad_sequence(text, padding_value = -1)
 
         # if returning loss, split text for next token prediction
 
@@ -573,133 +763,175 @@ class Transfusion(Module):
 
         assert len(modality_positions) == batch
 
-        modality_positions_original = modality_positions.copy()
-
         if isinstance(modality_positions, list):
             modality_positions = modality_positions_to_tensor(modality_positions, device = device)
 
+        if modality_positions.shape[-1] == 2: # Int['b m 2'] -> Int['b m 3'] if type is not given (one modality)
+            modality_positions = F.pad(modality_positions, (1, 0), value = 0)
+
+        # for now use dummy padding modality position info if empty (all zeros)
+
+        if modality_positions.numel() == 0:
+            modality_positions = F.pad(modality_positions, (0, 0, 0, 1))
+
         # embed the list of modality tokens into a sequence of Float['b n d'] at right offsets and lengths as dictated by modalities info tensor
 
-        if isinstance(modality_tokens, list):
-            modality_tokens = embed_modality_tokens(seq_len, self.flattened_dim, modality_tokens, modality_positions)
+        if torch.is_tensor(modality_tokens):
+            modality_tokens = [modality_tokens]
+
+        # transform the modality tokens from the vae encoder output into (batch, seq, feature) shape, if needed
+
+        transformed_modality_tokens = []
+
+        for batch_modality_tokens, batch_modality_position in zip(modality_tokens, modality_positions):
+            batch_transformed = []
+
+            for one_tokens, one_position in zip(batch_modality_tokens, batch_modality_position):
+                modality_type, _, _ = one_position
+                post_encode_transform = self.modality_token_transform[modality_type]
+                transformed = post_encode_transform(one_tokens)
+                batch_transformed.append(transformed)
+
+            transformed_modality_tokens.append(batch_transformed)
+
+        modality_tokens = transformed_modality_tokens
+
+        # embed the modality tokens into one Tensor if not given as one
+
+        if isinstance(modality_tokens, list) and isinstance(first(modality_tokens), list): # detect list[list[tensor]]
+            modality_tokens = [embed_modality_tokens(seq_len, dim_latent, modality_tokens, modality_positions, modality_id) for modality_id, dim_latent in enumerate(self.dim_latents)]
 
         # sort the modalities tensor and sanitize, readying for noising of modalities
 
-        #modality_positions, sorted_indices = order_modality_positions_by_seq_offset(modality_positions)
+        modality_positions, sorted_indices = order_modality_positions_by_seq_offset(modality_positions)
 
         num_modalities = modality_positions.shape[-2]
 
-        is_modalities = modality_positions_to_is_modality_mask(seq_len, modality_positions, device = device)
+        is_modalities = modality_positions_to_is_modality_mask(seq_len, modality_positions, num_modalities = self.num_modalities, device = device)
 
-        is_any_modality = reduce(is_modalities, 'b m n -> b n', 'any')
+        is_any_modality = reduce(is_modalities, 'b t m n -> b n', 'any')
 
-         # derive rotary positions
+        # embed text
+
+        text = text.masked_fill(text == -1, 0)
+
+        text_tokens = self.text_embed(text)
+
+        # noise the modality tokens
+
+        if not exists(times):
+            if callable(times): # todo: rename to another field (derive_times: Callable?)
+                times = times(modality_positions)
+            else:
+                times = torch.rand((batch, num_modalities), device = device)
+
+        times = einsum(is_modalities.float(), times, 'b t m n, b m -> b t n')
+
+        if return_loss:
+            noised_modality_tokens = []
+            flows = []
+
+            for modality_id, one_modality_tokens in enumerate(modality_tokens):
+                noise = torch.randn_like(one_modality_tokens)
+
+                one_times = times[:, modality_id]
+                padded_times = rearrange(one_times, 'b n -> b n 1')
+
+                one_noised_modality_tokens = one_modality_tokens * padded_times + noise * (1. - padded_times)
+
+                # the flow is the (data - noise)
+
+                one_flow = one_modality_tokens - noise
+
+                # append
+
+                flows.append(one_flow)
+                noised_modality_tokens.append(one_noised_modality_tokens)
+
+            modality_tokens = noised_modality_tokens
+
+        # project the modality tokens to model
+
+        modality_tokens = [fn(one_modality_tokens) for fn, one_modality_tokens in zip(self.latent_to_model_projs, modality_tokens)]
+
+        modality_tokens = sum(modality_tokens)
+
+        # intersperse the modalities with the text for the joint transformer + diffusion system
+
+        tokens = einx.where('b n, b n d, b n d', is_any_modality, modality_tokens, text_tokens)
+
+        # derive rotary positions
 
         rotary_positions = derive_rotary_positions_from_modality_positions(seq_len, modality_positions)
 
         rotary_emb = self.rotary_emb(rotary_positions)
         rotary_emb = rearrange(rotary_emb, 'b n d -> b 1 n d')
 
-        text_tokens = self.text_embed(text)
+        # attention
 
-        if return_loss:
-            
-            times = einsum(is_modalities.float(), times, 'b m n, b m -> b n')
-            padded_times = rearrange(times, 'b n -> b n 1')
-            noise = torch.randn_like(modality_tokens)
+        embed = self.transformer(
+            tokens,
+            times = reduce(times, 'b t n -> b n', 'sum'),
+            rotary_emb = rotary_emb,
+            modality_positions = modality_positions
+        )
 
-            modality_tokens = modality_tokens * padded_times + noise * (1. - padded_times)
-            noised_image = modality_tokens.clone().detach()
-            flow = modality_tokens - noise
-
-            modality_tokens_hidden = self.to_hidden(modality_tokens)
-
-            tokens = einx.where('b n, b n d, b n d', is_any_modality, modality_tokens_hidden, text_tokens)
-
-            embed = self.transformer(
-                    tokens,
-                    times = times,
-                    rotary_emb = rotary_emb,
-                    modality_positions = modality_positions
-                )  
-
-            pred_flow = self.to_pred_flow(embed)
-            with torch.no_grad():
-                output_tokens = modality_tokens + pred_flow
-        else:
-            with torch.no_grad():
-                steps = torch.linspace(start_timestep,1, num_inference_steps)
-                dn = (1.0 - start_timestep) / num_inference_steps
-                flow = torch.zeros_like(modality_tokens)
-                noised_image = modality_tokens.clone().detach()
-                noise = torch.randn_like(modality_tokens)
-                times = torch.full((batch,1), start_timestep, device=modality_tokens.device)
-                padded_times = rearrange(times, 'b n -> b n 1')
-                modality_tokens = modality_tokens * padded_times + noise * (1. - padded_times)
-
-                print(start_timestep, steps, padded_times)
-
-                for step in tqdm(steps, desc="Inference", leave=False):
-                    
-                    times = torch.full((batch,1), step, device=modality_tokens.device)
-                    times = einsum(is_modalities.float(), times, 'b m n, b m -> b n')
-                    
-
-                    modality_tokens_hidden = self.to_hidden(modality_tokens)
-
-                    tokens = einx.where('b n, b n d, b n d', is_any_modality, modality_tokens_hidden, text_tokens)
-
-                    embed = self.transformer(
-                    tokens,
-                    times = times,
-                    rotary_emb = rotary_emb,
-                    modality_positions = modality_positions
-                    )
-
-                    pred_flow = self.to_pred_flow(embed)
-
-                    modality_tokens = modality_tokens + pred_flow * dn # z + (x-z)*dn
-                output_tokens = modality_tokens
+        # text unembedding
 
         text_logits = self.to_text_logits(embed)
 
-        with torch.no_grad():
-            pfrom, plen = modality_positions_original[0][0]
-            output_tokens = output_tokens[:, pfrom:pfrom+plen, :]
-            ret_noise = noise[:, pfrom:pfrom+plen, :]
-            ret_flow = flow[:, pfrom:pfrom+plen, :]
-            ret_pred_flow = pred_flow[:, pfrom:pfrom+plen, :]
-            noised_image = noised_image[:, pfrom:pfrom+plen, :]
-
         if not return_loss:
-            return None, None, output_tokens, ret_noise, ret_flow, ret_pred_flow, noised_image
+            return text_logits
+
+        # calculate total tokens for weighing the loss
+
+        total_tokens = (text_labels != self.ignore_index).sum()
 
         # text autoregressive loss
+
+        text_labels = text_labels.masked_fill(is_any_modality, self.ignore_index)
 
         text_loss = F.cross_entropy(
             rearrange(text_logits, 'b n l -> b l n'),
             text_labels,
-            ignore_index = self.ignore_index,
-            reduction = 'none'
+            ignore_index = self.ignore_index
         )
 
-        text_loss = text_loss[~is_any_modality].mean()
+        text_loss_weight = (text_labels != self.ignore_index).sum() / total_tokens
 
         # diffusion loss
 
-        diffusion_loss = F.mse_loss(
-            pred_flow,
-            flow,
-            reduction = 'none'
-        )
+        pred_flows = [fn(embed) for fn in self.model_to_latent_preds]
 
-        diffusion_loss = diffusion_loss[is_any_modality].mean()
+        diffusion_losses = []
+        modality_loss_weights = []
+
+        for flow, pred_flow, is_one_modality in zip(flows, pred_flows, is_modalities.unbind(dim = 1)):
+
+            diffusion_loss = F.mse_loss(
+                pred_flow,
+                flow,
+                reduction = 'none'
+            )
+
+            is_one_modality = reduce(is_one_modality, 'b m n -> b n', 'any')
+
+            diffusion_loss = diffusion_loss[is_one_modality].mean()
+
+            modality_loss_weight = is_one_modality.sum() / total_tokens
+
+            modality_loss_weights.append(modality_loss_weight)
+
+            diffusion_losses.append(diffusion_loss)
 
         # only the token positions that are not modalities have autoregressive loss
 
         total_loss = (
-            text_loss +
-            diffusion_loss * self.diffusion_loss_weight
+            text_loss * text_loss_weight +
+            (torch.stack(diffusion_losses) * torch.stack(modality_loss_weights)).sum() * self.diffusion_loss_weight
         )
 
-        return total_loss, LossBreakdown(total_loss, text_loss, diffusion_loss), output_tokens, ret_noise, ret_flow, ret_pred_flow, noised_image
+        if not return_breakdown:
+            return total_loss
+
+        return total_loss, LossBreakdown(total_loss, text_loss, diffusion_losses)
