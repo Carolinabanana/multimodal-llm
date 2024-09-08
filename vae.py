@@ -34,10 +34,10 @@ def to_tensor(image:Image, size):
         
         return image_tensor
 
-def vae_encode(image:Image, size, vae):
+def vae_encode(image:Image, size, vae, accelerator):
     with torch.no_grad():
 
-        image_tensor = to_tensor(image, size).to(vae.device)
+        image_tensor = to_tensor(image, size).to(accelerator.device).unsqueeze(0)
         
         # Encode the image using the VAE
         
@@ -46,12 +46,12 @@ def vae_encode(image:Image, size, vae):
 
     return encoded_image
 
-def vae_encode_batch(images: torch.Tensor, vae, vae_batch_size: int):
+def vae_encode_batch(images: torch.Tensor, vae, vae_batch_size: int, accelerator):
     batch_size = images.shape[0]
     assert vae_batch_size <= batch_size, "VAE batch size must be less than or equal to the total batch size"
     
     encoded_images = []
-    images = images.to(vae.device)
+    images = images.to(accelerator.device)
     
     with torch.no_grad():
         for i in range(0, batch_size, vae_batch_size):

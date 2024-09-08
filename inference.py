@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from vae import vae_decode
 from PIL import Image
 
-def inference(model, optimizer, text, latents, save_path, steps=50, start_timestep=0.7):
+def inference(model, vae, optimizer, text, latents, save_path, steps=50, start_timestep=0.7):
         with torch.no_grad():
             model.eval()
             if torch.cuda.is_available():
@@ -16,7 +16,7 @@ def inference(model, optimizer, text, latents, save_path, steps=50, start_timest
             #todo add noise before inference loop
             _, _, denoised_tokens, _, _, _, _ = model(text=text, latents=latents, num_inference_steps=steps, return_loss=False, start_timestep=start_timestep)
    
-            decoded_images = vae_decode(denoised_tokens, model.vae)
+            decoded_images = vae_decode(denoised_tokens, vae)
 
             # Create a folder to save the images if it doesn't exist
             os.makedirs('inference_results', exist_ok=True)
@@ -28,14 +28,21 @@ def inference(model, optimizer, text, latents, save_path, steps=50, start_timest
             if torch.cuda.is_available():
                  optimizer.train()
 
-def debug_image(model, image_patches, noise, predicted_noise, target_noise, noisy_latent, denoised_image, epoch, step_counter):
+def debug_image(model, unpatchify, vae, image_patches, noise, predicted_noise, target_noise, noisy_latent, denoised_image, epoch, step_counter):
 
-    decoded_image_patches = vae_decode(image_patches, model.vae)
-    decoded_noise = vae_decode(noise, model.vae)
-    decoded_target_noise = vae_decode(target_noise, model.vae)
-    decoded_predicted_noise = vae_decode(predicted_noise, model.vae)
-    decoded_noisy_latent = vae_decode(noisy_latent, model.vae)
-    decoded_denoised_image = vae_decode(denoised_image, model.vae)  
+    image_patches = unpatchify(image_patches)
+    noise = unpatchify(noise)
+    predicted_noise = unpatchify(predicted_noise)
+    target_noise = unpatchify(target_noise)
+    noisy_latent = unpatchify(noisy_latent)
+    denoised_image = unpatchify(denoised_image)
+    
+    decoded_image_patches = vae_decode(image_patches, vae)
+    decoded_noise = vae_decode(noise, vae)
+    decoded_target_noise = vae_decode(target_noise, vae)
+    decoded_predicted_noise = vae_decode(predicted_noise, vae)
+    decoded_noisy_latent = vae_decode(noisy_latent, vae)
+    decoded_denoised_image = vae_decode(denoised_image, vae)  
 
     # Function to convert tensor to PIL Image
     def tensor_to_pil(tensor):
@@ -45,7 +52,7 @@ def debug_image(model, image_patches, noise, predicted_noise, target_noise, nois
         if tensor.shape[0] > 3:
             tensor = tensor[:3]  # Take only the first 3 channels
         return Image.fromarray((tensor.permute(1, 2, 0).numpy() * 255).astype('uint8'))
-
+    
     # Create un-decoded versions
     undecoded_image_patches = tensor_to_pil(image_patches[0])
     undecoded_noise = tensor_to_pil(noise[0])
