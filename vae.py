@@ -68,7 +68,7 @@ def vae_decode(latent, vae):
         decoded_image = vae.decode(latent.detach()[0].unsqueeze(0) / vae.config.scaling_factor).sample
 
         # Convert the processed image back to a PIL Image
-        decoded_image_np = decoded_image.squeeze().permute(1, 2, 0).cpu().numpy()
+        decoded_image_np = decoded_image.squeeze().permute(1, 2, 0).float().cpu().numpy()
         
         # Denormalize the pixel values
         decoded_image_np = (decoded_image_np / 2.0 + 0.5) * 255.0

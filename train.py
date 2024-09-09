@@ -1,7 +1,7 @@
 import os
 import torch
 from data import CachedDataset, TransfusionDataset, create_text_image_pairs, load_checkpoint, load_pairs_from_disk, patchify, unpatchify, resume_checkpoint, save_checkpoint, save_pairs_to_disk
-from transfusion2 import Transfusion
+from transfusion import Transfusion
 from transformers import AutoTokenizer
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -26,9 +26,9 @@ def train():
     parser.add_argument('--gradient_checkpointing', action='store_true', help='Use gradient checkpointing')
     parser.add_argument('--diffusion_loss_weight', type=float, default=5, help='Weight for the diffusion loss')
     parser.add_argument('--max_length', type=int, default=128, help='Max length for the input text')
-    parser.add_argument('--debug_steps', type=int, default=20, help='Number of steps to debug')
+    parser.add_argument('--debug_steps', type=int, default=200, help='Number of steps to debug')
     parser.add_argument('--inference_steps', type=int, default=200, help='Number of steps to inference')
-    parser.add_argument('--save_steps', type=int, default=200, help='Number of steps to save')
+    parser.add_argument('--save_steps', type=int, default=2000, help='Number of steps to save')
     parser.add_argument('--cache', action='store_true', help='Recache the dataset')
     parser.add_argument('--cache_batch_size', type=int, default=2, help='Batch size for cache loading')
 
@@ -94,7 +94,7 @@ def train():
     text_image_pairs = load_pairs_from_disk('pairs.pkl')
     print(f"Loaded {len(text_image_pairs)} text-image pairs")
 
-    dataset = TransfusionDataset(text_image_pairs, tokenizer, model, text_seq_len=max_length, image_seq_len=image_size // (patch_size * 8), image_size=image_size)
+    dataset = TransfusionDataset(text_image_pairs, tokenizer, model, text_seq_len=max_length, image_size=image_size)
 
     torch.cuda.empty_cache()
     # Cache the dataset

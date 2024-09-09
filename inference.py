@@ -7,15 +7,16 @@ import torch.nn.functional as F
 from vae import vae_decode
 from PIL import Image
 
-def inference(model, vae, optimizer, text, latents, save_path, steps=50, start_timestep=0.7):
+def inference(model, vae, optimizer, text, save_path, steps=50, modality_length=256):
         with torch.no_grad():
             model.eval()
             if torch.cuda.is_available():
                  optimizer.eval()
-
             #todo add noise before inference loop
-            _, _, denoised_tokens, _, _, _, _ = model(text=text, latents=latents, num_inference_steps=steps, return_loss=False, start_timestep=start_timestep)
-   
+            modality_sample = model.sample(prompt=text, curr_length=len(text), max_length=len(text)+modality_length, modality_steps=steps, modality_length=modality_length)
+
+            denoised_tokens = modality_sample[:-1024]
+
             decoded_images = vae_decode(denoised_tokens, vae)
 
             # Create a folder to save the images if it doesn't exist

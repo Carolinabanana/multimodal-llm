@@ -1,3 +1,26 @@
+"""
+MIT License
+
+Copyright (c) 2024 Phil Wang
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
 from __future__ import annotations
 
 """
@@ -25,14 +48,26 @@ import einx
 from einops import rearrange, repeat, reduce, einsum, pack
 from einops.layers.torch import Rearrange
 
-from transfusion_pytorch.tensor_typing import Float, Int, Bool
-
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
 from tqdm import tqdm
 
 pad_sequence = partial(pad_sequence, batch_first = True)
 
+# tensor typing
+
+import jaxtyping
+
+class TorchTyping:
+    def __init__(self, abstract_dtype):
+        self.abstract_dtype = abstract_dtype
+
+    def __getitem__(self, shapes: str):
+        return self.abstract_dtype[Tensor, shapes]
+
+Float = TorchTyping(jaxtyping.Float)
+Int   = TorchTyping(jaxtyping.Int)
+Bool  = TorchTyping(jaxtyping.Bool)
 # maybe flex attention
 
 try:
@@ -50,6 +85,15 @@ class LossBreakdown(NamedTuple):
     total: Float['']
     text: Float['']
     diffusion: list[Float['']]
+
+def eval_decorator(fn):
+    def inner(self, *args, **kwargs):
+        was_training = self.training
+        self.eval()
+        out = fn(self, *args, **kwargs)
+        self.train(was_training)
+        return out
+    return inner
 
 # helper functions
 
@@ -136,21 +180,17 @@ def modality_positions_to_tensor(
 def order_modality_positions_by_seq_offset(
     modalities: Int['b m 3']
 ) -> tuple[Int['b m 3'], Int['b m']]:
-
+    
     type, offsets, lengths = modalities.unbind(dim = -1)
 
     no_modality_mask = lengths <= 0 # there may be uneven number of modalities per batch sample
+    
     offsets_to_sort = offsets.masked_fill(no_modality_mask, 1e10)
     _, sorted_indices = offsets_to_sort.sort(dim = -1)
 
     # sort by ascending offset and do a final mask of both offset and length to 0
 
     modalities = einx.get_at('b [mi] ..., b mo -> b mo ...', modalities, sorted_indices)
-    modalities = einx.where('b m ..., b m ..., -> b m ...', torch.stack([
-        torch.ones_like(type, dtype=torch.bool),
-        ~no_modality_mask,
-        ~no_modality_mask
-    ], dim=-1), modalities, 0)
 
     return modalities, sorted_indices
 
@@ -170,6 +210,7 @@ def derive_rotary_positions_from_modality_positions(
     is_any_modality = reduce(modality_mask, 'b t m n -> b n', 'any')
 
     return torch.arange(seq_len, device = device) - is_any_modality.cumsum(dim = -1)
+    #return torch.arange(seq_len, device = device).unsqueeze(0).expand(modalities.shape[0], -1) #- is_any_modality.cumsum(dim = -1)
 
 # modality tokens are given as list of tensors, can be then be embedded into the modality tokens for attending alongside text tokens
 
@@ -319,8 +360,10 @@ class AdaptiveWrapper(Module):
     def forward(
         self,
         x: Float['b n {self.dim}'],
-        cond: Float['b {self.dim_cond}'] | Float['b n {self.dim_cond}'],
-        is_any_modality: Bool['b n'],
+        rotary_emb: Tensor | None = None,
+        attn_mask: Tensor | None = None,
+        cond: Float['b {self.dim_cond}'] | Float['b n {self.dim_cond}'] = None,
+        is_any_modality: Bool['b n'] = None,
         **kwargs
     ):
         is_any_modality = rearrange(is_any_modality, '... -> ... 1')
@@ -472,13 +515,17 @@ class Transformer(Module):
         ff_expansion_factor = 4,
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict(),
-        use_flex_attn = False
+        use_flex_attn = False,
+        gradient_checkpointing = False,
+        pretrained_model = None
     ):
         super().__init__()
         self.use_flex_attn = use_flex_attn
 
         self.dim = dim
         self.dim_head = dim_head
+        self.gradient_checkpointing = gradient_checkpointing
+        self.pretrained_model = pretrained_model
 
         self.to_time_cond = nn.Sequential(
             RandomFourierEmbed(dim),
@@ -541,10 +588,22 @@ class Transformer(Module):
         adaptive_kwargs = dict(cond = cond, is_any_modality = is_any_modality)
 
         # transformer layers as usual, using mask from above
-
+        
         for attn, ff in self.layers:
-            x = attn(x, rotary_emb = rotary_emb, **attn_mask_kwargs, **adaptive_kwargs) + x
-            x = ff(x, **adaptive_kwargs) + x
+            if self.gradient_checkpointing:
+                x = x + torch.utils.checkpoint.checkpoint(
+                    attn,
+                    x, rotary_emb, attn_mask, cond, is_any_modality,
+                    use_reentrant=False
+                )
+                x = x + torch.utils.checkpoint.checkpoint(
+                    ff,
+                    x, rotary_emb, attn_mask, cond, is_any_modality,
+                    use_reentrant=False
+                )
+            else:
+                x = attn(x, rotary_emb, attn_mask, cond, is_any_modality) + x
+                x = ff(x, rotary_emb, attn_mask, cond, is_any_modality) + x
 
         return self.norm(x)
 
@@ -599,11 +658,13 @@ class Transfusion(Module):
 
         # modality start and end ids
 
-        self.som_ids, self.eom_ids = som_eom_tensor.tolist()
+        self.som_ids, self.eom_ids = som_eom_tensor.tolist() #modality_start_end_tensor
 
         # entire "sentence" start and end id
 
         self.sos_id, self.eos_id = text_start_end_tensor.tolist()
+
+        print(self.sos_id, self.eos_id, self.som_ids, self.eom_ids)
 
         # modality transforms
 
@@ -643,34 +704,110 @@ class Transfusion(Module):
         return next(self.parameters()).device
 
     @torch.no_grad()
+    @eval_decorator
     def sample(
         self,
         prompt: ModalitySample | None = None,
         max_length = 8192,
         text_temperature = 1.5,
         text_min_p = 0.1,
+        modality_length = 32, # fix the modality token length for now, but this will be determined by the language model in a metadata tag
+        modality_steps = 16,
+        initial_latent: torch.Tensor | None = None,
     ) -> ModalitySample:
 
-        was_training = self.training
-        self.eval()
+        device = self.device
 
-        seq = tensor([self.sos_id], device = self.device)
+        init_text_seq = tensor([self.sos_id], device = self.device)
+        modality_sample = [init_text_seq]
 
-        for _ in tqdm(range(max_length)):
-            logits = self.forward([[seq]], return_loss = False)
-            logits = logits[0][-1]
+        curr_length = 0
+        curr_modality_id = 0
+        num_past_modalities = 0  # starts off with no modalities in output
+        is_decoding_text = False  # starts off with text decoding, and alternates with modalities depending on [som] tokens detected
 
-            logits = min_p_filter(logits, min_p = text_min_p)
-            probs = (logits / text_temperature).softmax(dim = -1)
+        with tqdm(total = max_length) as pbar:
 
-            sampled = torch.multinomial(probs, 1)
-            seq = torch.cat((seq, sampled), dim = -1)
+            while curr_length <= max_length:
 
-            if sampled.item() == self.eos_id:
-                break
+                if is_decoding_text:
+                    pbar.set_description('decoding text')
 
-        self.train(was_training)
-        return [seq]
+                    *_, seq = modality_sample
+
+                    logits = self.forward([modality_sample], return_loss = False)
+                    logits = logits[0][-1]
+
+                    logits = min_p_filter(logits, min_p = text_min_p)
+                    probs = (logits / text_temperature).softmax(dim = -1)
+
+                    sampled = torch.multinomial(probs, 1)
+
+                    seq = torch.cat((seq, sampled), dim = -1)
+                    modality_sample[-1] = seq
+
+                    pbar.update(1)
+                    curr_length += 1
+
+                    sampled_token_id = sampled.item()
+
+                    if sampled_token_id == self.eos_id:
+                        break
+
+                    if sampled_token_id in self.som_ids:
+                        curr_modality_id = self.som_ids.index(sampled_token_id)
+                        is_decoding_text = False
+
+                else:
+                    assert exists(curr_modality_id)
+                    pbar.set_description(f'decoding modality [{curr_modality_id}]')
+
+                    latent_dim = self.dim_latents[curr_modality_id]
+                    
+                    if exists(initial_latent) and curr_modality_id == 0:  # Assuming the first modality is the image
+                        noised_latent = initial_latent
+                    else:
+                        noised_latent = torch.randn((modality_length, latent_dim), device = device)
+
+                    def ode_step_fn(step_times, denoised):
+                        step_times = rearrange(step_times, ' -> 1 1') # batch size of 1
+                        step_times = F.pad(step_times, (num_past_modalities, 0), value = 1.) # past decoded modalities receive a time conditioning of 1.
+
+                        print(step_times)
+                        embeds = self.forward(
+                            [[*modality_sample, (curr_modality_id, denoised)]],
+                            times = step_times,
+                            return_embed = True,
+                        )
+
+                        to_flow_pred = self.model_to_latent_preds[curr_modality_id]
+                        flow = to_flow_pred(embeds)
+
+                        return flow[0, -modality_length:]
+
+                    times = torch.linspace(0, 1, modality_steps, device = device)
+                    trajectory = self.odeint_fn(ode_step_fn, noised_latent, times)
+
+                    # add the sampled modality tokens
+
+                    sampled_modality = trajectory[-1]
+                    modality_sample.append((curr_modality_id, sampled_modality))
+
+                    # add the appropriate [eom]
+
+                    eom_id = self.eom_ids[curr_modality_id]
+                    modality_sample.append(tensor([eom_id], device = device))
+
+                    # back to decoding text
+
+                    pbar.update(modality_length)
+                    curr_length += modality_length
+
+                    num_past_modalities += 1
+                    curr_modality_id = None
+                    is_decoding_text = True
+
+        return modality_sample
 
     def forward(
         self,
@@ -681,6 +818,7 @@ class Transfusion(Module):
             None
         ) = None,
         return_loss = True,
+        return_embed = False,
         return_breakdown = False
     ) -> (
         Float['b n l'] |
@@ -688,6 +826,7 @@ class Transfusion(Module):
         tuple[Float[''], LossBreakdown]
     ):
         device = self.device
+        return_loss &= not return_embed
 
         # add "sentence" start and end tokens when training
 
@@ -839,6 +978,8 @@ class Transfusion(Module):
 
                 one_noised_modality_tokens = one_modality_tokens * padded_times + noise * (1. - padded_times)
 
+                modality_tokens_original = one_noised_modality_tokens.detach().clone()
+
                 # the flow is the (data - noise)
 
                 one_flow = one_modality_tokens - noise
@@ -875,6 +1016,9 @@ class Transfusion(Module):
             rotary_emb = rotary_emb,
             modality_positions = modality_positions
         )
+
+        if return_embed:
+            return embed
 
         # text unembedding
 
@@ -926,12 +1070,15 @@ class Transfusion(Module):
 
         # only the token positions that are not modalities have autoregressive loss
 
-        total_loss = (
-            text_loss * text_loss_weight +
-            (torch.stack(diffusion_losses) * torch.stack(modality_loss_weights)).sum() * self.diffusion_loss_weight
-        )
+        total_loss = diffusion_loss
 
-        if not return_breakdown:
-            return total_loss
+        noised_image = modality_tokens_original
 
-        return total_loss, LossBreakdown(total_loss, text_loss, diffusion_losses)
+        noise = noise[is_one_modality].view(noise.shape[0], -1, noise.shape[2])
+        flow = flow[is_one_modality].view(flow.shape[0], -1, flow.shape[2])
+        pred_flow = pred_flow[is_one_modality].view(pred_flow.shape[0], -1, pred_flow.shape[2])
+        noised_image = noised_image[is_one_modality].view(noised_image.shape[0], -1, noised_image.shape[2])
+
+        denoised_tokens = noised_image + pred_flow * 0.3
+
+        return total_loss, LossBreakdown(total_loss, text_loss, diffusion_losses),denoised_tokens, noise, flow, pred_flow, noised_image

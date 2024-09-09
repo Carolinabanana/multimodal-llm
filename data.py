@@ -5,16 +5,16 @@ import torch
 from torchvision import transforms
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from natsort import natsorted
 
 from vae import to_tensor, vae_encode
 
 class TransfusionDataset(Dataset):
-    def __init__(self, text_image_pairs, tokenizer, model, text_seq_len, image_seq_len, image_size):
+    def __init__(self, text_image_pairs, tokenizer, model, text_seq_len, image_size):
         self.text_image_pairs = text_image_pairs
         self.tokenizer = tokenizer
         self.model = model
         self.max_length = text_seq_len
-        self.image_seq_len = image_seq_len
         self.image_size = image_size
 
     def __len__(self):
@@ -23,7 +23,7 @@ class TransfusionDataset(Dataset):
     def __getitem__(self, idx):
         text, image_path = self.text_image_pairs[idx]
 
-        tokenized_text = encode_text(text, self.tokenizer, self.image_seq_len, self.max_length)
+        tokenized_text = encode_text(text, self.tokenizer, self.max_length)
         # Calculate the length of the image sequence
         
         image = Image.open(image_path).convert("RGB")
@@ -39,7 +39,7 @@ class TransfusionDataset(Dataset):
             "pixel_values": pixel_values
         }
     
-def encode_text(text, tokenizer, image_seq_len, max_length):
+def encode_text(text, tokenizer, max_length):
 
     # Tokenize text with special tokens
     tokenized_text = tokenizer(text, max_length=max_length, padding="max_length", truncation=True, return_tensors="pt")
@@ -87,7 +87,7 @@ def save_checkpoint(model, optimizer, scheduler, loss, epoch, step_counter):
     os.makedirs('checkpoints', exist_ok=True)
     
     # Get list of existing checkpoints
-    checkpoint_files = sorted([f for f in os.listdir('checkpoints') if f.startswith('model_checkpoint_epoch_') and f.endswith('.pth')])
+    checkpoint_files = natsorted([f for f in os.listdir('checkpoints') if f.startswith('model_checkpoint_epoch_') and f.endswith('.pth')])
     
     # Remove older checkpoints if there are more than 3
     while len(checkpoint_files) >= 3:
@@ -107,9 +107,9 @@ def save_checkpoint(model, optimizer, scheduler, loss, epoch, step_counter):
     print("Model saved successfully.")
 
 def resume_checkpoint(model, optimizer, scheduler):
-    checkpoint_files = [f for f in os.listdir('./checkpoints') if f.startswith('model_checkpoint_epoch_') and f.endswith('.pth')]
+    checkpoint_files = [f for f in os.listdir('./checkpoints') if f.startswith('model') and f.endswith('.pth')]
     if checkpoint_files:
-        latest_checkpoint = max(checkpoint_files)
+        latest_checkpoint = natsorted(checkpoint_files)[-1]
         return load_checkpoint(f'./checkpoints/{latest_checkpoint}', model, optimizer, scheduler)
 
 def load_checkpoint(model_path, model, optimizer, scheduler):
