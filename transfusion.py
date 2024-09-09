@@ -535,7 +535,11 @@ class Transformer(Module):
 
         layers = ModuleList([])
 
-        for _ in range(depth):
+        for ind in range(depth):
+            is_latter_half = ind >= (depth // 2)
+
+            skip_proj = Linear(dim * 2, dim, bias = False) if is_latter_half else None
+
             attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = dropout, use_flex_attn = use_flex_attn, **attn_kwargs)
 
             ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor, **ff_kwargs)
@@ -543,7 +547,7 @@ class Transformer(Module):
             attn = AdaptiveWrapper(attn, dim = dim, dim_cond = dim * 4)
             ff = AdaptiveWrapper(ff, dim = dim, dim_cond = dim * 4)
 
-            layers.append(ModuleList([attn, ff]))
+            layers.append(ModuleList([attn, ff, skip_proj]))
 
         self.layers = layers
         self.norm = RMSNorm(dim)
@@ -588,8 +592,27 @@ class Transformer(Module):
         adaptive_kwargs = dict(cond = cond, is_any_modality = is_any_modality)
 
         # transformer layers as usual, using mask from above
-        
-        for attn, ff in self.layers:
+
+        depth = len(self.layers)
+
+        skips = []
+        new_cache = []
+
+        for ind, (attn, ff, skip_proj) in enumerate(self.layers):
+            layer = ind + 1
+            # skip connection
+            
+            is_first_half = layer <= (depth // 2)
+            is_later_half = not is_first_half
+
+            if is_first_half:
+                skips.append(x)
+
+            if is_later_half:
+                skip = skips.pop()
+                x = torch.cat((x, skip), dim = -1)
+                x = skip_proj(x)
+
             if self.gradient_checkpointing:
                 x = x + torch.utils.checkpoint.checkpoint(
                     attn,
@@ -1070,7 +1093,7 @@ class Transfusion(Module):
 
         # only the token positions that are not modalities have autoregressive loss
 
-        total_loss = diffusion_loss
+        total_loss = diffusion_loss * self.diffusion_loss_weight + text_loss 
 
         noised_image = modality_tokens_original
 

@@ -26,6 +26,10 @@ def train():
     parser.add_argument('--gradient_checkpointing', action='store_true', help='Use gradient checkpointing')
     parser.add_argument('--diffusion_loss_weight', type=float, default=5, help='Weight for the diffusion loss')
     parser.add_argument('--max_length', type=int, default=128, help='Max length for the input text')
+    parser.add_argument('--warmup_steps', type=int, default=0, help='Warmup steps for the scheduler')
+    parser.add_argument('--hidden_dim', type=int, default=1536, help='Transformer hidden dimension')
+    parser.add_argument('--depth', type=int, default=24, help='Transformer depth')
+    parser.add_argument('--heads', type=int, default=12, help='Number of attention heads')
     parser.add_argument('--debug_steps', type=int, default=200, help='Number of steps to debug')
     parser.add_argument('--inference_steps', type=int, default=200, help='Number of steps to inference')
     parser.add_argument('--save_steps', type=int, default=2000, help='Number of steps to save')
@@ -70,20 +74,23 @@ def train():
     print(f"Cache batch size: {cache_batch_size}")
 
     torch.manual_seed(42)
+    transformer = {
+        'dim': args.hidden_dim,         
+        'depth': args.depth,         
+        'dim_head': args.hidden_dim // args.heads,      
+        'heads': args.heads,         
+        'dropout': 0,      
+        'ff_expansion_factor': 4,
+        'gradient_checkpointing': gradient_checkpointing,
+        'pretrained_model': None
+    }
+    print(transformer)
     model = Transfusion(
     num_text_tokens = tokenizer.vocab_size,
     diffusion_loss_weight=diffusion_loss_weight,
     dim_latent = 4*patch_size*patch_size,
-    transformer = {
-        'dim': 1536,         
-        'depth': 16,         
-        'dim_head': 64,      
-        'heads': 12,         
-        'dropout': 0.1,      
-        'ff_expansion_factor': 4,
-        'gradient_checkpointing': gradient_checkpointing,
-        'pretrained_model': None
-    })
+    transformer=transformer
+    )
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total model parameters: {total_params}")
@@ -125,7 +132,17 @@ def train():
         optimizer.train()
 
     # Add LR scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs * len(dataloader) / 2, eta_min=1e-6)
+    from transformers import get_linear_schedule_with_warmup
+
+    # Calculate the total number of training steps
+    total_steps = len(dataloader) * num_epochs
+
+    # Create the learning rate scheduler
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
 
     # Initialize epoch and step counter
     start_epoch = 0
