@@ -38,7 +38,59 @@ class TransfusionDataset(Dataset):
             "attention_mask": tokenized_text.attention_mask.squeeze(),
             "pixel_values": pixel_values
         }
+
+class TransfusionVarDataset(Dataset):
+    def __init__(self, text_image_pairs, tokenizer, model, text_seq_len, scale_sizes):
+        self.text_image_pairs = text_image_pairs
+        self.tokenizer = tokenizer
+        self.model = model
+        self.max_length = text_seq_len
+        self.scale_sizes = scale_sizes
+
+    def __len__(self):
+        return len(self.text_image_pairs)
+
+    def __getitem__(self, idx):
+        text, image_path = self.text_image_pairs[idx]
+
+        tokenized_text = encode_text(text, self.tokenizer, self.max_length)
+        # Calculate the length of the image sequence
+        
+        image = Image.open(image_path).convert("RGB")
+        
+        # Load and process image
+        #image_latents = vae_encode(image, (self.image_size, self.image_size), self.model.vae, accelerator) 
+        pixel_values = [to_tensor(image, (self.image_size*8, self.image_size*8)) for self.image_size in self.scale_sizes] 
+        
+        return {
+            "text": text,
+            "input_ids": tokenized_text.input_ids.squeeze(),
+            "attention_mask": tokenized_text.attention_mask.squeeze(),
+            "pixel_values": pixel_values
+        }
+
+def TransfusionVarDataset_collate_fn(batch):
+
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+
+    # Assuming all images in the batch have the same number of scales
+    num_scales = len(batch[0]['pixel_values'])
+    pixel_values = [torch.stack([item['pixel_values'][i] for item in batch]) for i in range(num_scales)]
     
+    texts = [item['text'] for item in batch]
+    
+    return {
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'pixel_values': pixel_values,
+        'texts': texts
+    }
+
+
+
+
+
 def encode_text(text, tokenizer, max_length):
 
     # Tokenize text with special tokens
@@ -82,7 +134,7 @@ def load_pairs_from_disk(filename):
         pairs = pickle.load(f)
     return pairs
 
-def save_checkpoint(model, optimizer, scheduler, loss, epoch, step_counter):
+def save_checkpoint(model, optimizer, scheduler, epoch, step_counter):
     print(f"Saving model at step {step_counter}...")
     os.makedirs('checkpoints', exist_ok=True)
     
@@ -100,7 +152,6 @@ def save_checkpoint(model, optimizer, scheduler, loss, epoch, step_counter):
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
         'step_counter': step_counter,
     }, f'checkpoints/model_checkpoint_epoch_{epoch+1}_step_{step_counter}.pth')
     
@@ -128,6 +179,19 @@ def load_checkpoint(model_path, model, optimizer, scheduler):
 class CachedDataset(Dataset):
     def __init__(self, cache_dir, batch_size, accelerator):
         self.cache_files = sorted([f for f in os.listdir(cache_dir) if f.startswith(f'batch_{batch_size}_')])
+        self.cache_dir = cache_dir
+        self.accelerator = accelerator
+
+    def __len__(self):
+        return len(self.cache_files)
+
+    def __getitem__(self, idx):
+        data = torch.load(os.path.join(self.cache_dir, self.cache_files[idx]), map_location=torch.device('cpu'))
+        return data
+    
+class CachedVarDataset(Dataset):
+    def __init__(self, cache_dir, batch_size, accelerator):
+        self.cache_files = sorted([f for f in os.listdir(cache_dir) if f.startswith(f'batch_var_{batch_size}_')])
         self.cache_dir = cache_dir
         self.accelerator = accelerator
 
